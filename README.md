@@ -1,6 +1,6 @@
 # AutomationCapture
 
-AutomationCapture discovers browser workflows with a Claude-guided Selenium agent and records reusable artifacts for later deterministic replay. Phases 2 through 5 add page observation, browser actions, a bounded discovery loop, a versioned artifact schema, recording, and JSON file persistence. Replay, escalation, and the Flask target application will be implemented in later phases.
+AutomationCapture discovers browser workflows with a Claude-guided Selenium agent and records reusable artifacts for later deterministic replay. Phases 2 through 6 add page observation, browser actions, a bounded discovery loop, a versioned artifact schema, recording, JSON file persistence, and robust locator resolution. The replay engine, escalation, and the Flask target application will be implemented in later phases.
 
 ## Development setup
 
@@ -31,3 +31,7 @@ The loop returns `success`, `steps`, `final_state` (base64 PNG), `logs`, and `er
 `save_artifact_to_file(artifact, "artifacts/example.json")` creates parent directories and atomically replaces the destination. Saved files have three requested `#` metadata lines before the JSON body, so the entire saved file is **comment-prefixed JSON**, not a plain JSON document. Use `load_artifact_from_file(path)` to read it; the loader also accepts plain JSON files. Use `to_json()` when a consumer requires standard JSON. The loader checks the header version against the artifact and reports JSON parse errors using file line numbers.
 
 To save an agent-loop result, pass its `artifact` dictionary through `dict_to_artifact(result["artifact"])`, then call `save_artifact_to_file(...)` with your chosen path.
+
+## Locator resolution
+
+`LocatorResolver(wait_timeout=10).resolve(driver, locator)` returns the first visible Selenium element found by the primary locator or an ordered fallback. It accepts the Phase 3 `Locator` dataclass or a JSON-shaped locator dictionary, including nested fallbacks. Supported strategies are `css`, `xpath`, `id`, case-insensitive direct `text` (ASCII case mapping), and exact `aria_label`. A hidden element gets a visibility wait; a stale reference gets up to three fresh lookup attempts before the next fallback. The timeout applies to each visibility check, so several hidden candidates can extend the total time. An exhausted search raises `ElementNotFoundError` with every attempted locator and its reason. This component will be called by the Phase 7 replay engine.
