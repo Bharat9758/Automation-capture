@@ -1,6 +1,6 @@
 # AutomationCapture
 
-AutomationCapture discovers browser workflows with a Claude-guided Selenium agent and records reusable artifacts for later deterministic replay. Phases 2 through 6 add page observation, browser actions, a bounded discovery loop, a versioned artifact schema, recording, JSON file persistence, and robust locator resolution. The replay engine, escalation, and the Flask target application will be implemented in later phases.
+AutomationCapture discovers browser workflows with a Claude-guided Selenium agent and records reusable artifacts for later deterministic replay. Phases 2 through 7 add page observation, browser actions, a bounded discovery loop, a versioned artifact schema, recording, JSON file persistence, robust locator resolution, and deterministic replay. Escalation and the Flask target application will be implemented in later phases.
 
 ## Development setup
 
@@ -34,4 +34,24 @@ To save an agent-loop result, pass its `artifact` dictionary through `dict_to_ar
 
 ## Locator resolution
 
-`LocatorResolver(wait_timeout=10).resolve(driver, locator)` returns the first visible Selenium element found by the primary locator or an ordered fallback. It accepts the Phase 3 `Locator` dataclass or a JSON-shaped locator dictionary, including nested fallbacks. Supported strategies are `css`, `xpath`, `id`, case-insensitive direct `text` (ASCII case mapping), and exact `aria_label`. A hidden element gets a visibility wait; a stale reference gets up to three fresh lookup attempts before the next fallback. The timeout applies to each visibility check, so several hidden candidates can extend the total time. An exhausted search raises `ElementNotFoundError` with every attempted locator and its reason. This component will be called by the Phase 7 replay engine.
+`LocatorResolver(wait_timeout=10).resolve(driver, locator)` returns the first visible Selenium element found by the primary locator or an ordered fallback. It accepts the Phase 3 `Locator` dataclass or a JSON-shaped locator dictionary, including nested fallbacks. Supported strategies are `css`, `xpath`, `id`, case-insensitive direct `text` (ASCII case mapping), and exact `aria_label`. A hidden element gets a visibility wait; a stale reference gets up to three fresh lookup attempts before the next fallback. The timeout applies to each visibility check, so several hidden candidates can extend the total time. An exhausted search raises `ElementNotFoundError` with every attempted locator and its reason. The replay engine uses this resolver before element actions and output extraction.
+
+## Deterministic replay
+
+Load an artifact and run it with an existing Selenium driver; the replay engine makes no LLM calls:
+
+```python
+from src.artifact.serializer import load_artifact_from_file
+from src.replay.replay_engine import replay_artifact
+
+artifact = load_artifact_from_file("artifacts/lookup_member.json")
+result = replay_artifact(driver, artifact, {"member_id": "12345"})
+if result.success:
+    print(result.outputs)
+else:
+    print(result.error, result.step_failed)
+```
+
+Configure `ALLOWED_DOMAINS` to include the artifact target and all navigation destinations. Replay validates input types before navigating, substitutes named placeholders without changing the artifact, waits for document readiness, resolves every element through fallbacks, and verifies the final success checkpoint before extracting typed outputs. Missing or invalid inputs raise `src.replay.replay_engine.ValidationError`. Browser, action, checkpoint, and extraction failures return `ReplayResult(status="hard_failure")` with a screenshot, DOM, URL, and title when available. Failure evidence can contain page content and input data; handle it as sensitive data. Phase 8 will add business outcome and recoverable error classification.
+
+Step `expected_outcome` values can use `url_matches:<regex>`, `text_contains:<text>`, `text_changed:<css>`, `element_visible:<css>`, or `element_count:<css>=<count>` to assert an observable condition. Existing descriptive recorder text is treated as a description; the final artifact checkpoint is always enforced. Checkpoint actions accept a locator as an element-visible check, or an explicit condition directive in their `value`. `max_wait_ms` and each step's `timeout_ms` bound individual waits; nested locator fallbacks can increase total elapsed time.
