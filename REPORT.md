@@ -2,19 +2,19 @@
 
 ## 1. Summary
 
-Phases 1 through 4 establish the project structure, a bounded Claude-guided discovery loop, a reusable artifact schema, and a recorder for successful traces.
+Phases 1 through 5 establish the project structure, a bounded Claude-guided discovery loop, an artifact schema, recording, and JSON persistence.
 
 ## 2. Scope
 
-The agent observes one Selenium browser session and executes five action types on configured domains. The recorder converts successful traces to artifacts describing replay steps, inputs, outputs, and checkpoints. Persistence, replay, and escalation remain future phases.
+The agent observes one Selenium browser session and executes five action types on configured domains. The recorder converts successful traces to artifacts describing replay steps, inputs, outputs, and checkpoints. Artifacts can be saved to and loaded from disk. Replay and escalation remain future phases.
 
 ## 3. Architecture
 
-`Observer` collects browser signals; `llm_agent` sends the screenshot and state to Claude; `Actor` validates locators and domains before executing actions. The recorder maps completed traces into Pydantic dataclasses and validates their JSON shape. Module loggers write JSON events.
+`Observer` collects browser signals; `llm_agent` sends the screenshot and state to Claude; `Actor` validates locators and domains before executing actions. The recorder maps completed traces into Pydantic dataclasses. The serializer validates JSON Schema and cross-field rules, then writes comment-prefixed JSON files atomically. Module loggers write JSON events.
 
 ## 4. Implementation
 
-The loop enforces step and elapsed-time limits, detects three consecutive unchanged observations, validates model JSON, and returns action records without typed values. The recorder replaces typed literals with parameter placeholders, infers fields from successful reads, notes failed attempts, and adds locator robustness notes. Artifacts validate field types, semantic versions, dates, URLs, step ordering, and success rates.
+The loop enforces step and elapsed-time limits, detects three consecutive unchanged observations, validates model JSON, and returns action records without typed values. The recorder replaces typed literals with parameter placeholders, infers fields from successful reads, notes failed attempts, and adds locator robustness notes. The serializer provides plain JSON conversion and file round trips with field-specific errors.
 
 ## 5. Configuration
 
@@ -22,8 +22,8 @@ Copy `config.example.env` to `.env`. Choose an active `LLM_MODEL`, provide an AP
 
 ## 6. Verification
 
-Run `pytest -q`. Agent tests cover observation, domain restrictions, XPath escaping, typed-value omission, completion, dead-end, and step limits. Schema tests cover round trips and invalid fields. Recorder tests cover parameter and output inference, robustness notes, trace validation, and agent-loop integration. No live Claude request or real browser integration is exercised yet.
+Run `pytest -q`. Agent tests cover observation, domain restrictions, XPath escaping, typed-value omission, completion, dead-end, and step limits. Schema tests cover round trips and invalid fields. Recorder tests cover inference and integration. Serializer tests cover JSON and file round trips, metadata headers, invalid JSON, missing nested fields, and failed writes. No live Claude request or real browser integration is exercised yet.
 
 ## 7. Risks and Next Steps
 
-Claude's completion claim is not independently verified. A fallback URL checkpoint may be weaker than a page-specific success condition; output checkpoints currently check visibility rather than the exact extracted value. Artifact IDs cannot be checked for uniqueness across a repository until persistence exists. Browser integration, artifact persistence, independent goal checks, and more detailed safety controls remain to be implemented.
+Claude's completion claim is not independently verified. A fallback URL checkpoint may be weaker than a page-specific success condition; output checkpoints currently check visibility rather than the exact extracted value. Disk serialization does not provide a shared artifact index or global ID uniqueness. The three-line metadata header means saved files require the provided loader rather than an ordinary JSON parser. Browser integration, independent goal checks, and more detailed safety controls remain to be implemented.
