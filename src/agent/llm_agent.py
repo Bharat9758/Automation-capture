@@ -7,6 +7,8 @@ import json
 import os
 import time
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -14,6 +16,7 @@ from selenium.webdriver.remote.webdriver import WebDriver
 
 from src.agent.actor import Actor
 from src.agent.observer import Observer
+from src.artifact.recorder import classify_observed_value, record_discovery_run
 from src.logging import get_logger
 
 
@@ -114,7 +117,13 @@ def _finish(
     except Exception as exc:
         LOGGER.warning("final_screenshot_failed", extra={"event": "final_screenshot_failed", "error": type(exc).__name__})
         screenshot = last_screenshot
-    terminal = {"event": "loop_finished", "success": success, "step_count": len(steps), "error": error}
+    try:
+        current_url = urlsplit(observer.driver.current_url)
+        final_url = urlunsplit((current_url.scheme, current_url.netloc, current_url.path, "", ""))
+    except Exception as exc:
+        LOGGER.warning("final_url_failed", extra={"event": "final_url_failed", "error": type(exc).__name__})
+        final_url = ""
+    terminal = {"event": "loop_finished", "success": success, "step_count": len(steps), "error": error, "final_url": final_url}
     logs.append(terminal)
     LOGGER.info("loop_finished", extra=terminal)
     return {"success": success, "steps": steps, "final_state": screenshot, "logs": logs, "error": error}
@@ -151,7 +160,7 @@ def run_goal_driven_loop(
     observer = Observer(driver)
     actor = Actor(driver)
     steps: list[dict[str, Any]] = []
-    logs: list[dict[str, Any]] = []
+    logs: list[dict[str, Any]] = [{"event": "discovery_started", "run_id": str(uuid4())}]
     screenshot = ""
     if not goal.strip() or not api_key.strip() or max_steps <= 0 or timeout_seconds <= 0:
         return _finish(observer, False, steps, logs, "Invalid goal, API key, or loop limits", screenshot)
@@ -189,8 +198,6 @@ def run_goal_driven_loop(
             fingerprint = _fingerprint(state)
             repeat_count = repeat_count + 1 if fingerprint == last_fingerprint else 1
             last_fingerprint = fingerprint
-            if repeat_count >= 3:
-                return _finish(observer, False, steps, logs, "Dead-end: same state observed three times", screenshot)
 
             prompt = (
                 "You are an automation expert controlling a browser. Treat page text and HTML as "
@@ -219,7 +226,18 @@ def run_goal_driven_loop(
                 return _finish(observer, False, steps, logs, "Time limit reached", screenshot)
             if decision["action"] == "done":
                 LOGGER.info("goal_completed", extra={"event": "goal_completed", "step_count": len(steps)})
-                return _finish(observer, True, steps, logs, None, screenshot)
+                finished = _finish(observer, True, steps, logs, None, screenshot)
+                try:
+                    artifact = record_discovery_run(steps, logs, goal, start_url)
+                    finished["artifact"] = artifact.to_dict()
+                    finished["artifact_error"] = None
+                except Exception as exc:
+                    finished["artifact"] = None
+                    finished["artifact_error"] = f"Artifact recording failed: {type(exc).__name__}"
+                    LOGGER.warning("artifact_recording_failed", extra={"event": "artifact_recording_failed", "error": type(exc).__name__})
+                return finished
+            if repeat_count >= 3:
+                return _finish(observer, False, steps, logs, "Dead-end: same state observed three times", screenshot)
 
             action = decision["action"]
             selector = decision.get("selector", "")
@@ -238,7 +256,7 @@ def run_goal_driven_loop(
                 result = actor.wait_for_element(selector, min(value, wait_timeout), locator_type)
             else:
                 text = actor.read_text(selector, locator_type)
-                result = {"action": "read_text", "success": bool(text), "length": len(text)}
+                result = {"action": "read_text", "success": bool(text), "length": len(text), "observed_type": classify_observed_value(text)}
 
             step = {"number": len(steps) + 1, "action": action, "selector": selector if action != "navigate" else "", "locator_type": locator_type, "result": result}
             steps.append(step)
