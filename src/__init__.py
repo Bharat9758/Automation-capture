@@ -1,0 +1,1 @@
+"""AutomationCapture application package."""
