@@ -1,6 +1,6 @@
 # AutomationCapture
 
-AutomationCapture discovers browser workflows with a Claude-guided Selenium agent and records reusable artifacts for later deterministic replay. Phases 2 through 9 add page observation, browser actions, a bounded discovery loop, a versioned artifact schema, recording, JSON file persistence, robust locator resolution, deterministic replay, runtime outcome classification, and checkpoint verification. Escalation and the Flask target application will be implemented in later phases.
+AutomationCapture discovers browser workflows with a Claude-guided Selenium agent and records reusable artifacts for later deterministic replay. Phases 2 through 10 add page observation, browser actions, a bounded discovery loop, a versioned artifact schema, recording, JSON file persistence, robust locator resolution, deterministic replay, runtime outcome classification, checkpoint verification, and stuck state detection. The human handoff and Flask target application will be implemented in later phases.
 
 ## Development setup
 
@@ -83,3 +83,9 @@ The supported detection types are `text_contains`, `element_visible`, `url_match
 `CheckpointVerifier().verify(driver, checkpoint, resolver, timeout=10)` waits for a saved checkpoint before the replay engine extracts any outputs. Schema checkpoints support `element_visible`, `element_exists` (a hidden DOM node counts), `text_contains` (visible element or body text), `url_matches`, and `element_count` (exact number, with locator fallbacks). A timeout or browser error raises `CheckpointVerificationError` with the expected condition, last observed state, step number, and evidence. Replay returns a hard failure with that evidence unless a configured known business result is visible; output extraction is skipped.
 
 URL expectations use substring matching by default, with exact and regex choices available as `exact:<url>` and `regex:<pattern>`. Existing anchored regex expectations (`^...$`) continue to work. Use `partial:<fragment>` to explicitly request substring matching. `CHECKPOINT_URL_MATCH_MODE` sets the default (`auto`, `exact`, `partial`, or `regex`), and `CHECKPOINT_CASE_SENSITIVE` controls text comparisons. `CHECKPOINT_POLL_INTERVAL_SECONDS` controls how often checks repeat; `CHECKPOINT_PAGE_TEXT_CHARS` limits the page text snippet captured on failure. Checkpoint evidence can contain sensitive page content.
+
+## Stuck state detection
+
+`src.escalation.stuck_detector` fingerprints URL, title, visible text, and visible control count to detect repeated page states. Replay checks an upcoming click for risky words (such as `transfer` or `delete`) and multiple visible target matches before clicking. Three unchanged observations after meaningful actions also pause replay. Call `replay_artifact(..., request_human_help=True)` to pause before navigation.
+
+A pause returns `ReplayResult(status="recoverable_error", success=False, stuck_state=...)` with the reason, one-based pending step, recommendation, and browser snapshot. Hard failures keep `status="hard_failure"` and also carry `stuck_state` for escalation. No human notification or approval handling occurs yet; Phase 11 will consume this state. Business outcomes keep their own status. The signature truncation, repeat threshold, history length, risky keywords, and number of visible elements in evidence are configured with `STUCK_*` variables in `config.example.env`. Evidence contains full DOM and screenshots and may contain sensitive data.

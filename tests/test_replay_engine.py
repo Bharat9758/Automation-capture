@@ -116,6 +116,54 @@ def test_replay_end_to_end_without_llm(driver: Mock, artifact: AutomationArtifac
     assert "12345" not in str(artifact.to_dict())
 
 
+def test_risky_click_pauses_before_execution(driver: Mock, artifact: AutomationArtifact) -> None:
+    """Approval is needed before clicking a transfer control."""
+    payload = artifact.to_dict()
+    payload["steps"][2]["reasoning"] = "Transfer funds"
+    result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"})
+    assert result.status == "recoverable_error" and result.step_failed == 3
+    assert result.stuck_state is not None
+    assert result.stuck_state.reason == "Risky action requires human approval"
+    assert result.stuck_state.current_screenshot == base64.b64encode(b"png")
+    assert result.evidence["escalation_context"]["artifact_id"] == artifact.id
+    assert all(item.args[0] != "https://banking.example.com/transfer" for item in driver.get.call_args_list)
+
+
+def test_ambiguous_click_pauses(driver: Mock, artifact: AutomationArtifact) -> None:
+    """Two visible matches of a target selector require human choice."""
+    one = Mock(spec=WebElement)
+    one.is_displayed.return_value = True
+    two = Mock(spec=WebElement)
+    two.is_displayed.return_value = True
+    driver.find_elements.side_effect = lambda by, value: [one, two] if (by, value) == (By.ID, "search") else []
+    result = replay_artifact(driver, artifact, {"member_id": "12345"})
+    assert result.status == "recoverable_error" and result.step_failed == 3
+    assert result.stuck_state is not None and result.stuck_state.reason == "Ambiguous state - multiple matches"
+    assert result.outputs == {}
+
+
+def test_explicit_help_pauses_before_navigation(driver: Mock, artifact: AutomationArtifact) -> None:
+    """An explicit help request leaves the browser untouched by replay actions."""
+    result = replay_artifact(driver, artifact, {"member_id": "12345"}, request_human_help=True)
+    assert result.status == "recoverable_error" and result.step_failed == 0
+    assert result.stuck_state is not None and result.stuck_state.reason == "Human requested intervention"
+    driver.get.assert_not_called()
+
+
+def test_repeated_state_pauses_before_extraction(driver: Mock, artifact: AutomationArtifact) -> None:
+    """Three meaningful actions that leave the same page signature pause replay."""
+    payload = artifact.to_dict()
+    payload["steps"] = [
+        {"step_number": index, "action": "click", "locator": {"strategy": "id", "value": "search", "robustness_notes": "Stable ID"},
+         "value": None, "reasoning": "Refresh search", "expected_outcome": "Click completed"}
+        for index in (1, 2, 3)
+    ]
+    result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"})
+    assert result.status == "recoverable_error" and result.step_failed == 3
+    assert result.stuck_state is not None and result.stuck_state.reason == "Same state repeated - no progress"
+    assert result.outputs == {}
+
+
 def test_substitution_copies_fallbacks_and_preserves_braces(artifact: AutomationArtifact) -> None:
     """Every selector and value is substituted without editing saved steps."""
     locator = Locator(strategy="css", value="[data-id='{member_id}']", robustness_notes="ID",
@@ -304,7 +352,7 @@ def test_url_and_count_checkpoints(driver: Mock, artifact: AutomationArtifact) -
     payload["success_checkpoint"] = {"condition": "url_matches", "locator": None, "expected_value": r"/members/search$", "error_message": "Wrong page"}
     assert replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"}).success
     payload["success_checkpoint"] = {"condition": "element_count", "locator": {"strategy": "css", "value": ".result", "robustness_notes": "Result selector"}, "expected_value": "2", "error_message": "Wrong count"}
-    driver.find_elements.return_value = [Mock(spec=WebElement), Mock(spec=WebElement)]
+    driver.find_elements.side_effect = lambda by, selector: [Mock(spec=WebElement), Mock(spec=WebElement)] if (by, selector) == (By.CSS_SELECTOR, ".result") else []
     assert replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"}).success
 
 
@@ -326,6 +374,8 @@ def test_text_change_and_invalid_url_pattern(driver: Mock, artifact: AutomationA
     after.text = "ready"
     driver.find_elements.side_effect = [[before], [after]]
     assert wait_for_outcome(driver, "text_changed:.status", 30) is True
+    driver.find_elements.side_effect = None
+    driver.find_elements.return_value = []
 
     payload = artifact.to_dict()
     payload["success_checkpoint"] = {"condition": "url_matches", "locator": None, "expected_value": "regex:[", "error_message": "Invalid regex"}

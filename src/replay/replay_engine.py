@@ -25,6 +25,14 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from src.agent.actor import Actor
 from src.artifact.schema import ActionStep, AutomationArtifact, Checkpoint, Locator, OutputField
+from src.escalation.stuck_detector import (
+    StateTracker,
+    StuckState,
+    capture_escalation_context,
+    count_matching_elements,
+    detect_stuck_state,
+    record_step_in_history,
+)
 from src.logging import get_logger
 from src.replay.checkpoint import CheckpointVerificationError, CheckpointVerifier
 from src.replay.error_handler import (
@@ -60,6 +68,37 @@ class ReplayResult:
     logs: list[str] = field(default_factory=list)
     evidence: dict[str, Any] = field(default_factory=dict)
     duration_seconds: float = 0.0
+    stuck_state: StuckState | None = None
+
+
+def _current_replay_state(driver: WebDriver) -> dict[str, Any]:
+    """Observe low-cost page signals for progress and ambiguity checks.
+
+    Args:
+        driver: Active browser.
+
+    Returns:
+        URL, title, visible body text, and count of visible controls when available.
+    """
+    state: dict[str, Any] = {"current_url": "", "title": "", "visible_text": "", "element_count": 0}
+    for name, getter in (("current_url", lambda: driver.current_url), ("title", lambda: driver.title)):
+        try:
+            state[name] = getter()
+        except (WebDriverException, AttributeError, TypeError):
+            pass
+    try:
+        state["visible_text"] = driver.find_element(By.TAG_NAME, "body").text
+    except (WebDriverException, AttributeError, TypeError):
+        try:
+            state["visible_text"] = driver.page_source
+        except (WebDriverException, AttributeError, TypeError):
+            pass
+    try:
+        selector = os.environ.get("STUCK_VISIBLE_SELECTOR", "button,input,select,textarea,a,[role=button]")
+        state["element_count"] = sum(bool(node.is_displayed()) for node in driver.find_elements(By.CSS_SELECTOR, selector))
+    except (WebDriverException, AttributeError, TypeError):
+        pass
+    return state
 
 
 def _validate_inputs(artifact: AutomationArtifact, input_params: dict[str, Any]) -> None:
@@ -462,7 +501,8 @@ def capture_failure_evidence(driver: WebDriver, step_index: int) -> dict[str, An
 
 
 def replay_artifact(
-    driver: WebDriver, artifact: AutomationArtifact, input_params: dict[str, Any], max_wait_ms: int = 10000
+    driver: WebDriver, artifact: AutomationArtifact, input_params: dict[str, Any], max_wait_ms: int = 10000,
+    *, request_human_help: bool = False,
 ) -> ReplayResult:
     """Validate, navigate, execute, verify, and extract an artifact without Claude.
 
@@ -471,6 +511,7 @@ def replay_artifact(
         artifact: Validated saved automation artifact.
         input_params: Named values for declared parameters.
         max_wait_ms: Maximum wait per step or checkpoint, in milliseconds.
+        request_human_help: Pause before navigation for explicit human help.
 
     Returns:
         Replay result with outputs or a hard failure and browser evidence.
@@ -483,6 +524,8 @@ def replay_artifact(
         raise ValidationError("artifact must be a valid AutomationArtifact")
     if isinstance(max_wait_ms, bool) or not isinstance(max_wait_ms, int) or max_wait_ms <= 0:
         raise ValidationError("max_wait_ms must be a positive integer")
+    if not isinstance(request_human_help, bool):
+        raise ValidationError("request_human_help must be a boolean")
     try:
         recovery_limit = int(os.environ.get("REPLAY_MAX_RECOVERY_RETRIES", "1"))
         if recovery_limit < 0:
@@ -498,6 +541,46 @@ def replay_artifact(
     )
     logs: list[str] = ["Input validation passed"]
     LOGGER.info("replay_inputs_valid", extra={"event": "replay_inputs_valid", "artifact_id": artifact.id, "input_count": len(input_params)})
+    tracker = StateTracker()
+    step_history: list[dict[str, Any]] = []
+
+    def hydrate_stuck(stuck: StuckState, step_index: int) -> StuckState:
+        """Add browser evidence and recent safe actions to a detector decision.
+
+        Args:
+            stuck: Unhydrated detector decision.
+            step_index: Zero-based last attempted step.
+
+        Returns:
+            Complete, typed escalation context.
+        """
+        captured = capture_escalation_context(driver, artifact, step_index, stuck.reason, step_history)
+        merged = {**stuck.escalation_context, **captured, "current_step": stuck.current_step}
+        screenshot = captured.get("screenshot")
+        return replace(stuck, current_screenshot=screenshot.encode("ascii") if isinstance(screenshot, str) else b"",
+                       current_dom=captured.get("dom") if isinstance(captured.get("dom"), str) else "",
+                       escalation_context=merged)
+
+    def pause(stuck: StuckState, step_index: int) -> ReplayResult:
+        """Pause safely with a result suitable for Phase 11 human handoff.
+
+        Args:
+            stuck: Stuck state requiring human input.
+            step_index: Zero-based last executed step.
+
+        Returns:
+            Recoverable result with the complete escalation snapshot.
+        """
+        hydrated = hydrate_stuck(stuck, step_index)
+        logs.append(f"Step {hydrated.current_step}: {hydrated.reason}")
+        evidence = {"step_index": hydrated.current_step,
+                    "screenshot": hydrated.escalation_context.get("screenshot"),
+                    "dom": hydrated.current_dom,
+                    "current_url": hydrated.escalation_context.get("current_url"),
+                    "escalation_context": hydrated.escalation_context}
+        return ReplayResult(success=False, status="recoverable_error", error=hydrated.reason,
+                            step_failed=hydrated.current_step, logs=logs, evidence=evidence,
+                            duration_seconds=time.monotonic() - started, stuck_state=hydrated)
 
     def failure(step_number: int, message: str, checkpoint_evidence: dict[str, Any] | None = None) -> ReplayResult:
         """Build a hard failure with safely summarized diagnostics.
@@ -515,9 +598,14 @@ def replay_artifact(
         evidence = capture_failure_evidence(driver, step_number)
         if checkpoint_evidence is not None:
             evidence.update(checkpoint_evidence)
+        state = _current_replay_state(driver)
+        state.update({"screenshot": evidence.get("screenshot"), "dom": evidence.get("dom")})
+        stuck = detect_stuck_state(artifact, step_number - 1, state, {"classification": "hard_failure"}, tracker.get_history())
+        hydrated = hydrate_stuck(stuck, step_number - 1)
+        evidence["escalation_context"] = hydrated.escalation_context
         return ReplayResult(success=False, status="hard_failure", error=message, step_failed=step_number,
                             logs=logs, evidence=evidence,
-                            duration_seconds=time.monotonic() - started)
+                            duration_seconds=time.monotonic() - started, stuck_state=hydrated)
 
     def business_outcome(step_number: int, classification: ErrorClassification) -> ReplayResult:
         """Return a legitimate negative business result separately from failures.
@@ -561,6 +649,11 @@ def replay_artifact(
         LOGGER.info("replay_retry", extra={"event": "replay_retry", "artifact_id": artifact.id, "step": step_number, "retry": attempt + 1})
         return True
 
+    if request_human_help:
+        state = _current_replay_state(driver)
+        state["human_help_requested"] = True
+        return pause(detect_stuck_state(artifact, -1, state, {}, []), -1)
+
     try:
         _navigate(driver, artifact.target_url, max_wait_ms / 1000)
         logs.append("Navigation to artifact target completed")
@@ -571,6 +664,13 @@ def replay_artifact(
     for step in steps:
         timeout_ms = min(max_wait_ms, step.timeout_ms or max_wait_ms)
         resolver = LocatorResolver(wait_timeout=timeout_ms / 1000)
+        if step.action == "click" and step.locator is not None:
+            state = _current_replay_state(driver)
+            state["matching_element_count"] = count_matching_elements(driver, step.locator, resolver)
+            state["skip_no_progress"] = True
+            decision = detect_stuck_state(artifact, step.step_number - 2, state, {}, tracker.get_history())
+            if decision.is_stuck:
+                return pause(decision, step.step_number - 2)
         if step.action == "navigate" and step.value:
             step = replace(step, value=urljoin(artifact.target_url, step.value))
         for attempt in range(recovery_limit + 1):
@@ -595,6 +695,14 @@ def replay_artifact(
                 return failure(step.step_number, message)
             logs.append(f"Step {step.step_number}: {step.action} succeeded in {action_result['duration_ms']} ms")
             break
+        record_step_in_history(step_history, {"step_number": step.step_number, "action": step.action, "success": True})
+        if step.action in {"navigate", "click", "wait", "checkpoint"}:
+            state = _current_replay_state(driver)
+            decision = detect_stuck_state(artifact, step.step_number - 1, state, {}, tracker.get_history())
+            tracker.add_state(state, step.step_number)
+            step_history[-1]["state_signature"] = tracker.get_history()[-1]["state_signature"]
+            if decision.is_stuck:
+                return pause(decision, step.step_number - 1)
 
     final_index = len(steps) + 1
     final_resolver = LocatorResolver(wait_timeout=max_wait_ms / 1000)
