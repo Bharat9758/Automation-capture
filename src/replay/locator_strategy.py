@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import time
+import math
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -29,7 +31,7 @@ LOGGER = get_logger(__name__)
 class ElementNotFoundError(LookupError):
     """Report every attempted locator and why it could not become visible."""
 
-    def __init__(self, attempts: list[dict[str, Any]], wait_timeout: int) -> None:
+    def __init__(self, attempts: list[dict[str, Any]], wait_timeout: float) -> None:
         """Build a diagnostic failure without hiding fallback attempts.
 
         Args:
@@ -61,7 +63,7 @@ class LocatorResolver:
         Raises:
             ValueError: If the timeout is not positive.
         """
-        if isinstance(wait_timeout, bool) or not isinstance(wait_timeout, (int, float)) or wait_timeout <= 0:
+        if isinstance(wait_timeout, bool) or not isinstance(wait_timeout, (int, float)) or not math.isfinite(wait_timeout) or wait_timeout <= 0:
             raise ValueError("wait_timeout must be a positive number of seconds")
         self.wait_timeout = wait_timeout
 
@@ -123,34 +125,41 @@ class LocatorResolver:
         visit(root)
         return result
 
-    def resolve(self, driver: WebDriver, locator: Locator | Mapping[str, Any]) -> WebElement:
+    def resolve(self, driver: WebDriver, locator: Locator | Mapping[str, Any], *, timeout: float | None = None) -> WebElement:
         """Return the first visible element, trying fallbacks in order.
 
         Args:
             driver: Active Selenium WebDriver.
             locator: Primary locator and optional alternatives.
+            timeout: Optional total deadline across all fallback candidates.
 
         Returns:
             A currently visible WebElement reference.
 
         Raises:
             ElementNotFoundError: If all locators are absent, hidden, or stale.
+            ValueError: If an explicit timeout is not positive and finite.
         """
+        if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0):
+            raise ValueError("timeout must be a positive finite number")
         candidates = self._candidates(self._coerce_locator(locator))
+        deadline = time.monotonic() + timeout if timeout is not None else None
         attempts: list[dict[str, Any]] = []
         for index, candidate in enumerate(candidates):
             started = time.monotonic()
+            visible_timeout = min(self.wait_timeout, max(0.0, deadline - started)) if deadline is not None else self.wait_timeout
             reason = ""
             try:
                 element = self._find(driver, candidate)
-                if self._wait_for_visible(element, self.wait_timeout):
+                if self._wait_for_visible(element, visible_timeout):
                     duration = round((time.monotonic() - started) * 1000)
                     self._log_resolution_attempt(candidate.strategy, True, duration)
                     return element
-                reason = f"not visible within {self.wait_timeout}s"
+                reason = f"not visible within {visible_timeout}s"
             except StaleElementReferenceException:
                 try:
-                    element = self._handle_stale_element(driver, candidate)
+                    remaining = max(0.0, deadline - time.monotonic()) if deadline is not None else None
+                    element = self._handle_stale_element(driver, candidate, timeout=remaining)
                     duration = round((time.monotonic() - started) * 1000)
                     self._log_resolution_attempt(candidate.strategy, True, duration)
                     return element
@@ -163,7 +172,7 @@ class LocatorResolver:
             self._log_resolution_attempt(candidate.strategy, False, duration)
             if index + 1 < len(candidates):
                 LOGGER.info("locator_fallback", extra={"event": "locator_fallback", "next_strategy": candidates[index + 1].strategy})
-        raise ElementNotFoundError(attempts, self.wait_timeout)
+        raise ElementNotFoundError(attempts, timeout if timeout is not None else self.wait_timeout)
 
     def _find(self, driver: WebDriver, locator: Locator) -> WebElement:
         """Dispatch a candidate to its Selenium lookup strategy.
@@ -265,7 +274,7 @@ class LocatorResolver:
         """
         return driver.find_element(By.XPATH, f"//*[@aria-label={self._xpath_literal(aria_label)}]")
 
-    def _wait_for_visible(self, element: WebElement, timeout: int) -> bool:
+    def _wait_for_visible(self, element: WebElement, timeout: float) -> bool:
         """Wait on an existing reference until it becomes visible.
 
         ``visibility_of`` accepts a WebElement; Selenium's
@@ -280,19 +289,26 @@ class LocatorResolver:
 
         Raises:
             StaleElementReferenceException: If the reference goes stale.
+            ValueError: If locator polling is misconfigured.
         """
         try:
-            return bool(WebDriverWait(element, timeout).until(EC.visibility_of(element)))
+            poll = float(os.environ.get("LOCATOR_POLL_INTERVAL_SECONDS", "0.05"))
+            if not math.isfinite(poll) or poll <= 0:
+                raise ValueError("LOCATOR_POLL_INTERVAL_SECONDS must be positive and finite")
+            return bool(WebDriverWait(element, timeout, poll_frequency=min(poll, timeout) if timeout > 0 else poll).until(EC.visibility_of(element)))
         except TimeoutException:
             return False
 
-    def _handle_stale_element(self, driver: WebDriver, locator: Locator, retries: int = 3) -> WebElement:
+    def _handle_stale_element(
+        self, driver: WebDriver, locator: Locator, retries: int = 3, *, timeout: float | None = None
+    ) -> WebElement:
         """Find a fresh reference after staleness, retrying a bounded number of times.
 
         Args:
             driver: Active browser.
             locator: Same candidate that became stale.
             retries: Number of fresh lookup attempts.
+            timeout: Remaining visibility budget for this candidate.
 
         Returns:
             Fresh visible WebElement.
@@ -304,12 +320,14 @@ class LocatorResolver:
         """
         if retries < 1:
             raise ValueError("retries must be positive")
+        deadline = time.monotonic() + timeout if timeout is not None else None
         last_error: NoSuchElementException | StaleElementReferenceException | TimeoutException | None = None
         for attempt in range(1, retries + 1):
             LOGGER.info("locator_stale_retry", extra={"event": "locator_stale_retry", "strategy": locator.strategy, "retry": attempt})
             try:
                 fresh = self._find(driver, locator)
-                if self._wait_for_visible(fresh, self.wait_timeout):
+                remaining = max(0.0, deadline - time.monotonic()) if deadline is not None else self.wait_timeout
+                if self._wait_for_visible(fresh, remaining):
                     return fresh
                 raise TimeoutException("Fresh element did not become visible")
             except (NoSuchElementException, StaleElementReferenceException, TimeoutException) as exc:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from unittest.mock import Mock, call, patch
 
 import pytest
@@ -103,7 +104,7 @@ def test_hidden_primary_waits_then_uses_fallback() -> None:
 
         assert LocatorResolver(wait_timeout=2).resolve(driver, locator) is visible
 
-    assert wait_class.call_args_list == [call(hidden, 2), call(visible, 2)]
+    assert wait_class.call_args_list == [call(hidden, 2, poll_frequency=0.05), call(visible, 2, poll_frequency=0.05)]
     assert driver.find_element.call_args_list == [call(By.CSS_SELECTOR, ".hidden"), call(By.ID, "shown")]
 
 
@@ -200,3 +201,19 @@ def test_invalid_timeout_is_rejected() -> None:
     for timeout in (0, -1, True):
         with pytest.raises(ValueError, match="wait_timeout"):
             LocatorResolver(wait_timeout=timeout)
+
+
+def test_explicit_total_timeout_limits_hidden_fallbacks() -> None:
+    """Checkpoint lookups bound all fallback visibility waits together."""
+    driver = Mock(spec=WebDriver)
+    driver.find_element.side_effect = [make_element(False), make_element(False)]
+    locator = make_locator("id", "hidden-primary", [make_locator("id", "hidden-fallback")])
+    resolver = LocatorResolver(wait_timeout=1)
+    started = time.monotonic()
+
+    with pytest.raises(ElementNotFoundError) as raised:
+        resolver.resolve(driver, locator, timeout=0.03)
+
+    assert time.monotonic() - started < 0.25
+    assert len(raised.value.attempts) == 2
+    assert raised.value.wait_timeout == 0.03

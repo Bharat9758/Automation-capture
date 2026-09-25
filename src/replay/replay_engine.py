@@ -26,6 +26,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from src.agent.actor import Actor
 from src.artifact.schema import ActionStep, AutomationArtifact, Checkpoint, Locator, OutputField
 from src.logging import get_logger
+from src.replay.checkpoint import CheckpointVerificationError, CheckpointVerifier
 from src.replay.error_handler import (
     ErrorClassification,
     NavigationError,
@@ -498,20 +499,24 @@ def replay_artifact(
     logs: list[str] = ["Input validation passed"]
     LOGGER.info("replay_inputs_valid", extra={"event": "replay_inputs_valid", "artifact_id": artifact.id, "input_count": len(input_params)})
 
-    def failure(step_number: int, message: str) -> ReplayResult:
+    def failure(step_number: int, message: str, checkpoint_evidence: dict[str, Any] | None = None) -> ReplayResult:
         """Build a hard failure with safely summarized diagnostics.
 
         Args:
             step_number: Failed step or verification phase.
             message: Error category without input contents.
+            checkpoint_evidence: Captured checkpoint state when available.
 
         Returns:
             Failed replay result with best-effort browser evidence.
         """
         logs.append(f"Step {step_number}: {message}")
         LOGGER.error("replay_failed", extra={"event": "replay_failed", "artifact_id": artifact.id, "step": step_number, "error": message})
+        evidence = capture_failure_evidence(driver, step_number)
+        if checkpoint_evidence is not None:
+            evidence.update(checkpoint_evidence)
         return ReplayResult(success=False, status="hard_failure", error=message, step_failed=step_number,
-                            logs=logs, evidence=capture_failure_evidence(driver, step_number),
+                            logs=logs, evidence=evidence,
                             duration_seconds=time.monotonic() - started)
 
     def business_outcome(step_number: int, classification: ErrorClassification) -> ReplayResult:
@@ -593,18 +598,19 @@ def replay_artifact(
 
     final_index = len(steps) + 1
     final_resolver = LocatorResolver(wait_timeout=max_wait_ms / 1000)
+    verifier = CheckpointVerifier()
     for attempt in range(recovery_limit + 1):
         try:
-            if not _wait_checkpoint(driver, checkpoint, final_resolver, max_wait_ms / 1000):
-                raise TimeoutException("Success checkpoint did not match")
-        except (ValueError, WebDriverException) as exc:
+            verifier.verify(driver, checkpoint, final_resolver, timeout=max_wait_ms / 1000, step_number=final_index)
+        except (CheckpointVerificationError, ValueError, WebDriverException) as exc:
             classification = detect_and_classify_error(driver, artifact, final_index, exc)
             if classification.classification == "expected_business_outcome":
                 return business_outcome(final_index, classification)
             if maybe_recover(final_index, classification, final_resolver, attempt, False):
                 continue
-            default = f"Success checkpoint failed: {checkpoint.error_message}" if isinstance(exc, TimeoutException) else f"Success checkpoint error: {type(exc).__name__}"
-            return failure(final_index, classification.error_message if classification.classification == "hard_failure" and classification.error_message and artifact.known_errors else default)
+            default = f"Success checkpoint failed: {checkpoint.error_message}" if isinstance(exc, CheckpointVerificationError) else f"Success checkpoint error: {type(exc).__name__}"
+            return failure(final_index, classification.error_message if classification.classification == "hard_failure" and classification.error_message and artifact.known_errors else default,
+                           exc.evidence if isinstance(exc, CheckpointVerificationError) else None)
         break
     logs.append("Success checkpoint passed")
 

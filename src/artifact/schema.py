@@ -88,7 +88,7 @@ class ActionStep:
 class Checkpoint:
     """Expected browser condition with a useful failure message."""
 
-    condition: Literal["element_visible", "text_contains", "url_matches", "element_count"]
+    condition: Literal["element_visible", "element_exists", "text_contains", "url_matches", "element_count"]
     locator: Locator | None
     expected_value: str | None
     error_message: str = Field(min_length=1)
@@ -103,13 +103,15 @@ class Checkpoint:
         Raises:
             ValueError: If the condition cannot be evaluated.
         """
-        if self.condition in {"element_visible", "element_count"} and self.locator is None:
+        if self.condition in {"element_visible", "element_exists", "element_count"} and self.locator is None:
             raise ValueError(f"{self.condition} requires a locator")
         if self.condition in {"text_contains", "url_matches", "element_count"} and self.expected_value is None:
             raise ValueError(f"{self.condition} requires an expected value")
+        if self.condition in {"text_contains", "url_matches"} and not self.expected_value:
+            raise ValueError(f"{self.condition} requires a nonempty expected value")
         if self.condition == "element_count":
             try:
-                if int(self.expected_value) < 0:
+                if not self.expected_value.isdecimal() or int(self.expected_value) < 0:
                     raise ValueError("element_count must be nonnegative")
             except (TypeError, ValueError) as exc:
                 raise ValueError("element_count must be a nonnegative integer") from exc

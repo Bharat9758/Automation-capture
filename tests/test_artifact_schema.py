@@ -111,6 +111,39 @@ def test_action_and_checkpoint_require_operands(artifact_data: dict[str, Any]) -
         AutomationArtifact.from_dict(payload)
 
 
+def test_element_exists_checkpoint_requires_locator(artifact_data: dict[str, Any]) -> None:
+    """A DOM existence checkpoint is supported and needs a selector.
+
+    Args:
+        artifact_data: Valid artifact fixture.
+    """
+    payload = deepcopy(artifact_data)
+    payload["success_checkpoint"] = {
+        "condition": "element_exists", "locator": {"strategy": "id", "value": "receipt",
+                                                    "fallbacks": None, "robustness_notes": "Stable ID"},
+        "expected_value": None, "error_message": "Receipt node missing",
+    }
+    assert AutomationArtifact.from_dict(payload).success_checkpoint.condition == "element_exists"
+    payload["success_checkpoint"]["locator"] = None
+    with pytest.raises(PydanticValidationError):
+        AutomationArtifact.from_dict(payload)
+
+
+@pytest.mark.parametrize("condition", ["text_contains", "url_matches"])
+def test_empty_checkpoint_expectation_is_rejected(artifact_data: dict[str, Any], condition: str) -> None:
+    """Empty text or URL expectations cannot pass every page.
+
+    Args:
+        artifact_data: Valid artifact fixture.
+        condition: Checkpoint condition under test.
+    """
+    payload = deepcopy(artifact_data)
+    payload["success_checkpoint"]["condition"] = condition
+    payload["success_checkpoint"]["expected_value"] = ""
+    with pytest.raises(PydanticValidationError):
+        AutomationArtifact.from_dict(payload)
+
+
 def test_step_numbers_and_dates_are_ordered(artifact_data: dict[str, Any]) -> None:
     """Step numbering and timestamps follow a deterministic order."""
     payload = deepcopy(artifact_data)

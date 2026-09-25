@@ -1,6 +1,6 @@
 # AutomationCapture
 
-AutomationCapture discovers browser workflows with a Claude-guided Selenium agent and records reusable artifacts for later deterministic replay. Phases 2 through 7 add page observation, browser actions, a bounded discovery loop, a versioned artifact schema, recording, JSON file persistence, robust locator resolution, and deterministic replay. Escalation and the Flask target application will be implemented in later phases.
+AutomationCapture discovers browser workflows with a Claude-guided Selenium agent and records reusable artifacts for later deterministic replay. Phases 2 through 9 add page observation, browser actions, a bounded discovery loop, a versioned artifact schema, recording, JSON file persistence, robust locator resolution, deterministic replay, runtime outcome classification, and checkpoint verification. Escalation and the Flask target application will be implemented in later phases.
 
 ## Development setup
 
@@ -35,6 +35,8 @@ To save an agent-loop result, pass its `artifact` dictionary through `dict_to_ar
 ## Locator resolution
 
 `LocatorResolver(wait_timeout=10).resolve(driver, locator)` returns the first visible Selenium element found by the primary locator or an ordered fallback. It accepts the Phase 3 `Locator` dataclass or a JSON-shaped locator dictionary, including nested fallbacks. Supported strategies are `css`, `xpath`, `id`, case-insensitive direct `text` (ASCII case mapping), and exact `aria_label`. A hidden element gets a visibility wait; a stale reference gets up to three fresh lookup attempts before the next fallback. The timeout applies to each visibility check, so several hidden candidates can extend the total time. An exhausted search raises `ElementNotFoundError` with every attempted locator and its reason. The replay engine uses this resolver before element actions and output extraction.
+
+For time-limited checkpoint lookups, pass `timeout=<seconds>` to `resolve` to bound the total visibility budget across fallbacks. `LOCATOR_POLL_INTERVAL_SECONDS` controls visibility polling and is capped at the remaining wait.
 
 ## Deterministic replay
 
@@ -75,3 +77,9 @@ Add a detection rule in `known_errors` to classify an observed page state. For e
 ```
 
 The supported detection types are `text_contains`, `element_visible`, `url_matches` (substring match), and `element_count` (integer `expected_count`). A matched business result returns `success=False`, `status="business_outcome"`, its `business_outcome`, and no system error. A matched `hard_failure` stops replay. A `recoverable_condition` may define a `recovery_action` with `action` set to `click`, `type`, or `navigate`; navigation uses `ALLOWED_DOMAINS`. Recovery and retries are bounded by `REPLAY_MAX_RECOVERY_RETRIES` (default 1). Stale elements and timeouts without a known rule retry only read, wait, type, checkpoint, or navigation actions. Clicks do not retry automatically because their effects might have completed before the exception. `ERROR_DETECTION_TIMEOUT_SECONDS` bounds each visible-element detection attempt. A matched business result also takes precedence over a passing but weak success checkpoint. Older recorder entries containing only `action` and `error_type` are diagnostics and cannot match a business result without a detection rule.
+
+## Checkpoint verification
+
+`CheckpointVerifier().verify(driver, checkpoint, resolver, timeout=10)` waits for a saved checkpoint before the replay engine extracts any outputs. Schema checkpoints support `element_visible`, `element_exists` (a hidden DOM node counts), `text_contains` (visible element or body text), `url_matches`, and `element_count` (exact number, with locator fallbacks). A timeout or browser error raises `CheckpointVerificationError` with the expected condition, last observed state, step number, and evidence. Replay returns a hard failure with that evidence unless a configured known business result is visible; output extraction is skipped.
+
+URL expectations use substring matching by default, with exact and regex choices available as `exact:<url>` and `regex:<pattern>`. Existing anchored regex expectations (`^...$`) continue to work. Use `partial:<fragment>` to explicitly request substring matching. `CHECKPOINT_URL_MATCH_MODE` sets the default (`auto`, `exact`, `partial`, or `regex`), and `CHECKPOINT_CASE_SENSITIVE` controls text comparisons. `CHECKPOINT_POLL_INTERVAL_SECONDS` controls how often checks repeat; `CHECKPOINT_PAGE_TEXT_CHARS` limits the page text snippet captured on failure. Checkpoint evidence can contain sensitive page content.

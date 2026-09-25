@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 from datetime import date
 from typing import Any
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
 
 import pytest
 from selenium.common.exceptions import (
@@ -19,6 +19,7 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.remote.webelement import WebElement
 
 from src.artifact.schema import ActionStep, AutomationArtifact, Locator, OutputField
+from src.replay.checkpoint import CheckpointVerificationError
 from src.replay.replay_engine import (
     ValidationError,
     capture_failure_evidence,
@@ -250,6 +251,25 @@ def test_final_checkpoint_failure_blocks_outputs(driver: Mock, artifact: Automat
 
     assert result.status == "hard_failure" and result.step_failed == 5
     assert result.outputs == {} and result.evidence["step_index"] == 5
+    assert result.evidence["expected"]["condition"] == "url_matches"
+    assert result.evidence["observed"] == "https://banking.example.com/members/search"
+
+
+def test_verification_is_required_before_output_extraction(driver: Mock, artifact: AutomationArtifact) -> None:
+    """A verifier failure stops replay before any extraction call."""
+    rejected = CheckpointVerificationError(
+        "Wrong state", expected_condition="element_visible", actual_state={"visible": False},
+        step_number=5, evidence={"expected": {"condition": "element_visible"}, "observed": {"visible": False}},
+    )
+    with patch("src.replay.replay_engine.CheckpointVerifier.verify", side_effect=rejected) as verify, patch(
+        "src.replay.replay_engine.extract_output"
+    ) as extract:
+        result = replay_artifact(driver, artifact, {"member_id": "12345"}, max_wait_ms=30)
+
+    verify.assert_called_once()
+    extract.assert_not_called()
+    assert result.status == "hard_failure" and result.step_failed == 5
+    assert result.evidence["observed"] == {"visible": False}
 
 
 def test_output_conversion_failure_is_hard_failure(driver: Mock, artifact: AutomationArtifact) -> None:
@@ -308,11 +328,12 @@ def test_text_change_and_invalid_url_pattern(driver: Mock, artifact: AutomationA
     assert wait_for_outcome(driver, "text_changed:.status", 30) is True
 
     payload = artifact.to_dict()
-    payload["success_checkpoint"] = {"condition": "url_matches", "locator": None, "expected_value": "[", "error_message": "Invalid regex"}
-    result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"})
+    payload["success_checkpoint"] = {"condition": "url_matches", "locator": None, "expected_value": "regex:[", "error_message": "Invalid regex"}
+    result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"}, max_wait_ms=30)
     assert result.status == "hard_failure"
     assert result.step_failed == 5
-    assert result.error == "Success checkpoint error: ValueError"
+    assert result.error == "Success checkpoint failed: Invalid regex"
+    assert result.evidence["observed"]["error_type"] == "error"
 
 
 def test_failure_evidence_survives_broken_screenshot(driver: Mock) -> None:
