@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field, replace
@@ -25,12 +26,20 @@ from selenium.webdriver.support.ui import WebDriverWait
 from src.agent.actor import Actor
 from src.artifact.schema import ActionStep, AutomationArtifact, Checkpoint, Locator, OutputField
 from src.logging import get_logger
+from src.replay.error_handler import (
+    ErrorClassification,
+    NavigationError,
+    detect_and_classify_error,
+    detect_known_error,
+    execute_recovery_action,
+)
 from src.replay.locator_strategy import ElementNotFoundError, LocatorResolver
 
 
 LOGGER = get_logger(__name__)
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _OUTCOME_CONDITIONS = {"url_matches", "text_contains", "text_changed", "element_visible", "element_count"}
+_IMPLICIT_RETRY_ACTIONS = {"navigate", "type", "read_text", "wait", "checkpoint"}
 
 
 class ValidationError(ValueError):
@@ -182,10 +191,10 @@ def _navigate(driver: WebDriver, url: str, timeout_seconds: float) -> None:
         TimeoutException: If the document stays unready.
     """
     if not Actor.is_allowed_url(url):
-        raise ValueError("Navigation URL is outside ALLOWED_DOMAINS")
+        raise NavigationError("Navigation URL is outside ALLOWED_DOMAINS")
     driver.get(url)
     if not Actor.is_allowed_url(driver.current_url):
-        raise ValueError("Navigation redirected outside ALLOWED_DOMAINS")
+        raise NavigationError("Navigation redirected outside ALLOWED_DOMAINS")
     WebDriverWait(driver, timeout_seconds).until(lambda browser: browser.execute_script("return document.readyState") == "complete")
 
 
@@ -314,17 +323,25 @@ def wait_for_outcome(driver: WebDriver, expected_outcome: str, timeout: int) -> 
     return _wait_checkpoint(driver, checkpoint, resolver, timeout / 1000)
 
 
-def execute_action(driver: WebDriver, action: ActionStep, locator_resolver: LocatorResolver) -> dict[str, Any]:
+def execute_action(
+    driver: WebDriver, action: ActionStep, locator_resolver: LocatorResolver, *, raise_on_error: bool = False
+) -> dict[str, Any]:
     """Execute one substituted step and return structured timing and details.
 
     Args:
         driver: Active browser.
         action: A complete, substituted action.
         locator_resolver: Resolver configured for this step's timeout.
+        raise_on_error: Preserve the original exception for replay classification.
 
     Returns:
         Success, elapsed milliseconds, and safe details. Read results contain
         text for the caller but text is never written to structured logs.
+
+    Raises:
+        ElementNotFoundError: When requested and no locator resolves.
+        WebDriverException: When requested and Selenium fails.
+        ValueError: When requested and the action is invalid.
     """
     started = time.monotonic()
     details: dict[str, Any] = {}
@@ -365,6 +382,8 @@ def execute_action(driver: WebDriver, action: ActionStep, locator_resolver: Loca
     except (ElementNotFoundError, WebDriverException, ValueError) as exc:
         duration = round((time.monotonic() - started) * 1000)
         LOGGER.warning("replay_action_failed", extra={"event": "replay_action_failed", "step": action.step_number, "action": action.action, "error_type": type(exc).__name__, "duration_ms": duration})
+        if raise_on_error:
+            raise
         return {"success": False, "duration_ms": duration, "details": {}, "error": type(exc).__name__}
 
 
@@ -463,6 +482,12 @@ def replay_artifact(
         raise ValidationError("artifact must be a valid AutomationArtifact")
     if isinstance(max_wait_ms, bool) or not isinstance(max_wait_ms, int) or max_wait_ms <= 0:
         raise ValidationError("max_wait_ms must be a positive integer")
+    try:
+        recovery_limit = int(os.environ.get("REPLAY_MAX_RECOVERY_RETRIES", "1"))
+        if recovery_limit < 0:
+            raise ValueError("negative retries")
+    except ValueError as exc:
+        raise ValidationError("REPLAY_MAX_RECOVERY_RETRIES must be a nonnegative integer") from exc
     _validate_inputs(artifact, input_params)
     steps = substitute_input_parameters(artifact.steps, input_params)
     checkpoint = replace(
@@ -489,6 +514,48 @@ def replay_artifact(
                             logs=logs, evidence=capture_failure_evidence(driver, step_number),
                             duration_seconds=time.monotonic() - started)
 
+    def business_outcome(step_number: int, classification: ErrorClassification) -> ReplayResult:
+        """Return a legitimate negative business result separately from failures.
+
+        Args:
+            step_number: Step where the known outcome appeared.
+            classification: Matched known error rule.
+
+        Returns:
+            Completed, non-successful business outcome without a system error.
+        """
+        logs.append(f"Step {step_number}: business outcome {classification.business_outcome}")
+        LOGGER.info("replay_business_outcome", extra={"event": "replay_business_outcome", "artifact_id": artifact.id, "step": step_number, "business_outcome": classification.business_outcome})
+        return ReplayResult(success=False, status="business_outcome", business_outcome=classification.business_outcome,
+                            logs=logs, duration_seconds=time.monotonic() - started)
+
+    def maybe_recover(
+        step_number: int, classification: ErrorClassification, resolver: LocatorResolver,
+        attempt: int, implicit_safe: bool,
+    ) -> bool:
+        """Perform at most the configured number of safe retries for one phase.
+
+        Args:
+            step_number: Failing step or verification phase.
+            classification: Classified recoverable condition.
+            resolver: Bounded element resolver for explicit repair.
+            attempt: Number of prior retries already used.
+            implicit_safe: Whether repeating without a repair is safe.
+
+        Returns:
+            True if the caller should retry the phase.
+        """
+        if not classification.should_continue or attempt >= recovery_limit:
+            return False
+        if classification.recovery_action is not None:
+            if not execute_recovery_action(driver, classification.recovery_action, resolver):
+                return False
+        elif not implicit_safe:
+            return False
+        logs.append(f"Step {step_number}: recovery completed; retry {attempt + 1}/{recovery_limit}")
+        LOGGER.info("replay_retry", extra={"event": "replay_retry", "artifact_id": artifact.id, "step": step_number, "retry": attempt + 1})
+        return True
+
     try:
         _navigate(driver, artifact.target_url, max_wait_ms / 1000)
         logs.append("Navigation to artifact target completed")
@@ -501,35 +568,74 @@ def replay_artifact(
         resolver = LocatorResolver(wait_timeout=timeout_ms / 1000)
         if step.action == "navigate" and step.value:
             step = replace(step, value=urljoin(artifact.target_url, step.value))
-        action_result = execute_action(driver, step, resolver)
-        if not action_result["success"]:
-            return failure(step.step_number, f"{step.action} failed: {action_result['error']}")
-        try:
-            achieved = wait_for_outcome(driver, step.expected_outcome, timeout_ms)
-        except (ValueError, WebDriverException) as exc:
-            return failure(step.step_number, f"Outcome check failed: {type(exc).__name__}")
-        if not achieved:
-            return failure(step.step_number, "Expected outcome timed out")
-        logs.append(f"Step {step.step_number}: {step.action} succeeded in {action_result['duration_ms']} ms")
+        for attempt in range(recovery_limit + 1):
+            phase = "action"
+            try:
+                action_result = execute_action(driver, step, resolver, raise_on_error=True)
+                phase = "outcome"
+                if not wait_for_outcome(driver, step.expected_outcome, timeout_ms):
+                    raise TimeoutException("Expected outcome timed out")
+            except (ElementNotFoundError, WebDriverException, ValueError) as exc:
+                classification = detect_and_classify_error(driver, artifact, step.step_number, exc)
+                if classification.classification == "expected_business_outcome":
+                    return business_outcome(step.step_number, classification)
+                if maybe_recover(step.step_number, classification, resolver, attempt, step.action in _IMPLICIT_RETRY_ACTIONS and phase == "action"):
+                    continue
+                default = (
+                    f"{step.action} failed: {type(exc).__name__}" if phase == "action"
+                    else "Expected outcome timed out" if isinstance(exc, TimeoutException)
+                    else f"Outcome check failed: {type(exc).__name__}"
+                )
+                message = classification.error_message if classification.classification == "hard_failure" and classification.error_message and artifact.known_errors else default
+                return failure(step.step_number, message)
+            logs.append(f"Step {step.step_number}: {step.action} succeeded in {action_result['duration_ms']} ms")
+            break
 
     final_index = len(steps) + 1
-    try:
-        if not _wait_checkpoint(driver, checkpoint, LocatorResolver(wait_timeout=max_wait_ms / 1000), max_wait_ms / 1000):
-            return failure(final_index, f"Success checkpoint failed: {checkpoint.error_message}")
-    except (ValueError, WebDriverException) as exc:
-        return failure(final_index, f"Success checkpoint error: {type(exc).__name__}")
+    final_resolver = LocatorResolver(wait_timeout=max_wait_ms / 1000)
+    for attempt in range(recovery_limit + 1):
+        try:
+            if not _wait_checkpoint(driver, checkpoint, final_resolver, max_wait_ms / 1000):
+                raise TimeoutException("Success checkpoint did not match")
+        except (ValueError, WebDriverException) as exc:
+            classification = detect_and_classify_error(driver, artifact, final_index, exc)
+            if classification.classification == "expected_business_outcome":
+                return business_outcome(final_index, classification)
+            if maybe_recover(final_index, classification, final_resolver, attempt, False):
+                continue
+            default = f"Success checkpoint failed: {checkpoint.error_message}" if isinstance(exc, TimeoutException) else f"Success checkpoint error: {type(exc).__name__}"
+            return failure(final_index, classification.error_message if classification.classification == "hard_failure" and classification.error_message and artifact.known_errors else default)
+        break
     logs.append("Success checkpoint passed")
+
+    # A weak recorded checkpoint can still pass on a negative-result page.
+    # Detect explicit business and hard-failure banners before returning data.
+    observed = detect_known_error(driver, artifact, final_index) if artifact.known_errors else None
+    if observed is not None:
+        if observed.classification == "expected_business_outcome":
+            return business_outcome(final_index, observed)
+        if observed.classification == "hard_failure":
+            return failure(final_index, observed.error_message or "Known hard failure observed")
 
     outputs: dict[str, Any] = {}
     for output in artifact.outputs:
-        try:
-            resolved_output = replace(
-                output,
-                extraction_locator=_substitute_locator(output.extraction_locator, input_params) if output.extraction_locator else None,
-            )
-            outputs[output.name] = extract_output(driver, resolved_output, LocatorResolver(wait_timeout=max_wait_ms / 1000))
-        except (ElementNotFoundError, WebDriverException, ValueError) as exc:
-            return failure(final_index, f"Output {output.name} failed: {type(exc).__name__}")
+        resolved_output = replace(
+            output,
+            extraction_locator=_substitute_locator(output.extraction_locator, input_params) if output.extraction_locator else None,
+        )
+        output_resolver = LocatorResolver(wait_timeout=max_wait_ms / 1000)
+        for attempt in range(recovery_limit + 1):
+            try:
+                outputs[output.name] = extract_output(driver, resolved_output, output_resolver)
+            except (ElementNotFoundError, WebDriverException, ValueError) as exc:
+                classification = detect_and_classify_error(driver, artifact, final_index, exc)
+                if classification.classification == "expected_business_outcome":
+                    return business_outcome(final_index, classification)
+                if maybe_recover(final_index, classification, output_resolver, attempt, True):
+                    continue
+                default = f"Output {output.name} failed: {type(exc).__name__}"
+                return failure(final_index, classification.error_message if classification.classification == "hard_failure" and classification.error_message and artifact.known_errors else default)
+            break
         logs.append(f"Output {output.name} extracted")
         LOGGER.info("replay_output", extra={"event": "replay_output", "artifact_id": artifact.id, "field": output.name})
     duration = time.monotonic() - started

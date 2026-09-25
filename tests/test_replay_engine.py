@@ -8,7 +8,12 @@ from typing import Any
 from unittest.mock import Mock, call
 
 import pytest
-from selenium.common.exceptions import NoSuchElementException, WebDriverException
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    NoSuchElementException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.remote.webelement import WebElement
@@ -317,3 +322,288 @@ def test_failure_evidence_survives_broken_screenshot(driver: Mock) -> None:
     assert evidence["screenshot"] is None
     assert evidence["screenshot_error"] == "WebDriverException"
     assert evidence["dom"] == "<html>Accounts</html>"
+
+
+def test_member_not_found_is_a_business_outcome(driver: Mock, artifact: AutomationArtifact) -> None:
+    """An observed negative business result is not reported as a system error."""
+    payload = artifact.to_dict()
+    payload["known_errors"] = {
+        "member_not_found": {
+            "detection": {"type": "text_contains", "locator": {"strategy": "css", "value": ".error-message"},
+                          "expected_text": "No such member"},
+            "classification": "expected_business_outcome", "business_outcome": "member_not_found",
+        },
+    }
+    original = driver.find_element.side_effect
+
+    def with_error(by: str, selector: str) -> Mock:
+        """Show the business result after searching.
+
+        Args:
+            by: Selenium strategy.
+            selector: Requested locator.
+
+        Returns:
+            Matching error text or normal element.
+        """
+        if by == By.CSS_SELECTOR and selector == ".error-message":
+            error = Mock(spec=WebElement)
+            error.is_displayed.return_value = True
+            error.text = "No such member"
+            return error
+        if by == By.ID and selector == "balance":
+            raise NoSuchElementException("balance not rendered")
+        return original(by, selector)
+
+    driver.find_element.side_effect = with_error
+    result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "missing"}, max_wait_ms=30)
+
+    assert result.success is False and result.status == "business_outcome"
+    assert result.business_outcome == "member_not_found"
+    assert result.error is None and result.step_failed is None
+    assert result.outputs == {} and result.evidence == {}
+    assert "missing" not in str(result.logs)
+
+
+def test_business_outcome_at_final_checkpoint(driver: Mock, artifact: AutomationArtifact) -> None:
+    """An alternate business result is recognized after successful steps."""
+    payload = artifact.to_dict()
+    payload["known_errors"] = {
+        "permission_denied": {"detection": {"type": "url_matches", "expected_url": "/members/search"},
+                              "classification": "expected_business_outcome", "business_outcome": "permission_denied"},
+    }
+    payload["success_checkpoint"] = {"condition": "url_matches", "locator": None, "expected_value": "/never", "error_message": "Missing success page"}
+    result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"}, max_wait_ms=30)
+    assert result.status == "business_outcome" and result.business_outcome == "permission_denied"
+
+
+def test_business_outcome_preempts_weak_success_checkpoint(driver: Mock, artifact: AutomationArtifact) -> None:
+    """A passing URL checkpoint cannot hide a configured negative result."""
+    payload = artifact.to_dict()
+    payload["success_checkpoint"] = {"condition": "url_matches", "locator": None, "expected_value": "/members/search", "error_message": "Wrong page"}
+    payload["known_errors"] = {
+        "account_exists": {"detection": {"type": "text_contains", "locator": {"strategy": "css", "value": ".message"},
+                                         "expected_text": "Account already exists"},
+                           "classification": "expected_business_outcome"},
+    }
+    original = driver.find_element.side_effect
+
+    def find_message(by: str, selector: str) -> Mock:
+        """Expose a business result alongside the normal page elements.
+
+        Args:
+            by: Selenium strategy.
+            selector: Requested locator.
+
+        Returns:
+            Browser element.
+        """
+        if by == By.CSS_SELECTOR and selector == ".message":
+            element = Mock(spec=WebElement)
+            element.is_displayed.return_value = True
+            element.text = "Account already exists"
+            return element
+        return original(by, selector)
+
+    driver.find_element.side_effect = find_message
+    result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"})
+    assert result.status == "business_outcome" and result.business_outcome == "account_exists"
+    assert result.outputs == {}
+
+
+def test_recovery_dismisses_dialog_and_retries_click(driver: Mock, artifact: AutomationArtifact) -> None:
+    """A known modal repair runs once before retrying the blocked step."""
+    payload = artifact.to_dict()
+    payload["known_errors"] = {
+        "unexpected_dialog": {
+            "detection": {"type": "element_visible", "locator": {"strategy": "id", "value": "modal"}},
+            "classification": "recoverable_condition",
+            "recovery_action": {"action": "click", "locator": {"strategy": "id", "value": "dismiss"}},
+        },
+    }
+    state = {"active": True, "search_attempts": 0, "dismissals": 0}
+    original = driver.find_element.side_effect
+
+    def find_dynamic(by: str, selector: str) -> Mock:
+        """Expose the modal until its dismiss control is clicked.
+
+        Args:
+            by: Selenium strategy.
+            selector: Requested locator.
+
+        Returns:
+            Element reflecting current modal state.
+        """
+        if by == By.ID and selector == "modal":
+            if not state["active"]:
+                raise NoSuchElementException()
+            modal = Mock(spec=WebElement)
+            modal.is_displayed.return_value = True
+            return modal
+        if by == By.ID and selector == "dismiss":
+            dismiss = Mock(spec=WebElement)
+            dismiss.is_displayed.return_value = True
+
+            def close() -> None:
+                """Dismiss the test dialog."""
+                state["dismissals"] += 1
+                state["active"] = False
+
+            dismiss.click.side_effect = close
+            return dismiss
+        if by == By.ID and selector == "search":
+            button = original(by, selector)
+
+            def submit() -> None:
+                """Block a submission while the dialog covers the button."""
+                state["search_attempts"] += 1
+                if state["active"]:
+                    raise ElementClickInterceptedException("modal overlay")
+
+            button.click.side_effect = submit
+            return button
+        return original(by, selector)
+
+    driver.find_element.side_effect = find_dynamic
+    result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"})
+    assert result.success is True
+    assert state == {"active": False, "search_attempts": 2, "dismissals": 1}
+    assert any("recovery completed" in line for line in result.logs)
+
+
+def test_transient_read_retry_is_bounded(driver: Mock, artifact: AutomationArtifact, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An idempotent read retries once, then reports repeated timeouts."""
+    monkeypatch.setenv("REPLAY_MAX_RECOVERY_RETRIES", "1")
+    original = driver.find_element.side_effect
+    state = {"reads": 0}
+
+    class FlakyBalance:
+        """Visible element whose first text read times out."""
+
+        def is_displayed(self) -> bool:
+            """Report the element as visible.
+
+            Returns:
+                True.
+            """
+            return True
+
+        @property
+        def text(self) -> str:
+            """Fail the first read and then expose the balance.
+
+            Returns:
+                Balance after the first read.
+
+            Raises:
+                TimeoutException: On the first read.
+            """
+            state["reads"] += 1
+            if state["reads"] == 1:
+                raise TimeoutException("slow page")
+            return "$5,000.00"
+
+    def find_flaky(by: str, selector: str) -> Any:
+        """Return the flaky value only for the balance selector.
+
+        Args:
+            by: Selenium strategy.
+            selector: Requested locator.
+
+        Returns:
+            Matching mock element.
+        """
+        return FlakyBalance() if by == By.ID and selector == "balance" else original(by, selector)
+
+    driver.find_element.side_effect = find_flaky
+    result = replay_artifact(driver, artifact, {"member_id": "12345"})
+    assert result.success is True and result.outputs == {"savings_balance": 5000}
+    assert state["reads"] >= 2
+    assert any("retry 1/1" in line for line in result.logs)
+
+
+def test_unknown_click_timeout_is_not_retried(driver: Mock, artifact: AutomationArtifact) -> None:
+    """Potentially irreversible clicks require an explicit repair rule."""
+    original = driver.find_element.side_effect
+    attempts = {"count": 0}
+
+    def blocked_click(by: str, selector: str) -> Mock:
+        """Raise a timeout on the only click attempt.
+
+        Args:
+            by: Selenium strategy.
+            selector: Requested locator.
+
+        Returns:
+            Selenium element double.
+        """
+        element = original(by, selector)
+        if selector == "search":
+            def time_out() -> None:
+                """Count and fail an uncertain click."""
+                attempts["count"] += 1
+                raise TimeoutException("uncertain completion")
+
+            element.click.side_effect = time_out
+        return element
+
+    driver.find_element.side_effect = blocked_click
+    result = replay_artifact(driver, artifact, {"member_id": "12345"})
+    assert result.status == "hard_failure" and result.step_failed == 3
+    assert attempts["count"] == 1
+
+
+def test_failed_explicit_recovery_stops_replay(driver: Mock, artifact: AutomationArtifact) -> None:
+    """A broken dismiss control cannot trigger an unbounded click loop."""
+    payload = artifact.to_dict()
+    payload["known_errors"] = {
+        "unexpected_dialog": {
+            "detection": {"type": "element_visible", "locator": {"strategy": "id", "value": "modal"}},
+            "classification": "recoverable_condition",
+            "recovery_action": {"action": "click", "locator": {"strategy": "id", "value": "missing-dismiss"}},
+        },
+    }
+    original = driver.find_element.side_effect
+    state = {"search_attempts": 0}
+
+    def find_modal(by: str, selector: str) -> Mock:
+        """Expose a modal but no repair button.
+
+        Args:
+            by: Selenium strategy.
+            selector: Requested locator.
+
+        Returns:
+            Matching element.
+        """
+        if by == By.ID and selector == "modal":
+            element = Mock(spec=WebElement)
+            element.is_displayed.return_value = True
+            return element
+        element = original(by, selector)
+        if by == By.ID and selector == "search":
+            def fail() -> None:
+                """Reject one blocked search click."""
+                state["search_attempts"] += 1
+                raise ElementClickInterceptedException()
+
+            element.click.side_effect = fail
+        return element
+
+    driver.find_element.side_effect = find_modal
+    result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"}, max_wait_ms=30)
+    assert result.status == "hard_failure" and result.step_failed == 3
+    assert state["search_attempts"] == 1
+
+
+def test_known_hard_failure_preempts_passing_checkpoint(driver: Mock, artifact: AutomationArtifact) -> None:
+    """An authentication warning overrides an unrelated passing checkpoint."""
+    payload = artifact.to_dict()
+    payload["success_checkpoint"] = {"condition": "url_matches", "locator": None, "expected_value": "/members/search", "error_message": "Wrong page"}
+    payload["known_errors"] = {
+        "authentication_failed": {"detection": {"type": "url_matches", "expected_url": "/members/search"},
+                                  "classification": "hard_failure", "message": "Authentication failed"},
+    }
+    result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"})
+    assert result.status == "hard_failure" and result.error == "Authentication failed"
+    assert result.outputs == {} and result.step_failed == 5

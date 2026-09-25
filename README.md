@@ -52,6 +52,26 @@ else:
     print(result.error, result.step_failed)
 ```
 
-Configure `ALLOWED_DOMAINS` to include the artifact target and all navigation destinations. Replay validates input types before navigating, substitutes named placeholders without changing the artifact, waits for document readiness, resolves every element through fallbacks, and verifies the final success checkpoint before extracting typed outputs. Missing or invalid inputs raise `src.replay.replay_engine.ValidationError`. Browser, action, checkpoint, and extraction failures return `ReplayResult(status="hard_failure")` with a screenshot, DOM, URL, and title when available. Failure evidence can contain page content and input data; handle it as sensitive data. Phase 8 will add business outcome and recoverable error classification.
+Configure `ALLOWED_DOMAINS` to include the artifact target and all navigation destinations. Replay validates input types before navigating, substitutes named placeholders without changing the artifact, waits for document readiness, resolves every element through fallbacks, and verifies the final success checkpoint before extracting typed outputs. Missing or invalid inputs raise `src.replay.replay_engine.ValidationError`. Browser, action, checkpoint, and extraction failures return `ReplayResult(status="hard_failure")` with a screenshot, DOM, URL, and title when available. Failure evidence can contain page content and input data; handle it as sensitive data.
 
 Step `expected_outcome` values can use `url_matches:<regex>`, `text_contains:<text>`, `text_changed:<css>`, `element_visible:<css>`, or `element_count:<css>=<count>` to assert an observable condition. Existing descriptive recorder text is treated as a description; the final artifact checkpoint is always enforced. Checkpoint actions accept a locator as an element-visible check, or an explicit condition directive in their `value`. `max_wait_ms` and each step's `timeout_ms` bound individual waits; nested locator fallbacks can increase total elapsed time.
+
+## Runtime outcomes and recovery
+
+Add a detection rule in `known_errors` to classify an observed page state. For example:
+
+```json
+{
+  "member_not_found": {
+    "detection": {
+      "type": "text_contains",
+      "locator": {"strategy": "css", "value": ".error-message", "robustness_notes": "Visible search feedback"},
+      "expected_text": "No such member"
+    },
+    "classification": "expected_business_outcome",
+    "business_outcome": "member_not_found"
+  }
+}
+```
+
+The supported detection types are `text_contains`, `element_visible`, `url_matches` (substring match), and `element_count` (integer `expected_count`). A matched business result returns `success=False`, `status="business_outcome"`, its `business_outcome`, and no system error. A matched `hard_failure` stops replay. A `recoverable_condition` may define a `recovery_action` with `action` set to `click`, `type`, or `navigate`; navigation uses `ALLOWED_DOMAINS`. Recovery and retries are bounded by `REPLAY_MAX_RECOVERY_RETRIES` (default 1). Stale elements and timeouts without a known rule retry only read, wait, type, checkpoint, or navigation actions. Clicks do not retry automatically because their effects might have completed before the exception. `ERROR_DETECTION_TIMEOUT_SECONDS` bounds each visible-element detection attempt. A matched business result also takes precedence over a passing but weak success checkpoint. Older recorder entries containing only `action` and `error_type` are diagnostics and cannot match a business result without a detection rule.
