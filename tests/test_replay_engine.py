@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from datetime import date
+from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, call, patch
 
@@ -19,6 +20,7 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.remote.webelement import WebElement
 
 from src.artifact.schema import ActionStep, AutomationArtifact, Locator, OutputField
+from src.escalation.escalation_request import load_escalation_request
 from src.replay.checkpoint import CheckpointVerificationError
 from src.replay.replay_engine import (
     ValidationError,
@@ -63,17 +65,20 @@ def artifact() -> AutomationArtifact:
 
 
 @pytest.fixture
-def driver(monkeypatch: pytest.MonkeyPatch) -> Mock:
+def driver(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Mock:
     """Create a browser double with navigation and a visible savings output.
 
     Args:
         monkeypatch: Environment test fixture.
+        tmp_path: Temporary evidence directory fixture.
 
     Returns:
         Mock browser.
     """
     monkeypatch.setenv("ALLOWED_DOMAINS", "banking.example.com")
+    monkeypatch.setenv("ESCALATION_DIRECTORY", str(tmp_path / "evidence" / "escalations"))
     browser = Mock(spec=WebDriver)
+    browser.session_id = "session-test"
     browser.current_url = "https://banking.example.com/app"
     browser.title = "Accounts"
     browser.page_source = "<html>Accounts</html>"
@@ -116,16 +121,19 @@ def test_replay_end_to_end_without_llm(driver: Mock, artifact: AutomationArtifac
     assert "12345" not in str(artifact.to_dict())
 
 
-def test_risky_click_pauses_before_execution(driver: Mock, artifact: AutomationArtifact) -> None:
+def test_risky_click_pauses_before_execution(driver: Mock, artifact: AutomationArtifact, tmp_path: Path) -> None:
     """Approval is needed before clicking a transfer control."""
     payload = artifact.to_dict()
     payload["steps"][2]["reasoning"] = "Transfer funds"
     result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"})
-    assert result.status == "recoverable_error" and result.step_failed == 3
+    assert result.status == "escalated" and result.step_failed == 3
     assert result.stuck_state is not None
     assert result.stuck_state.reason == "Risky action requires human approval"
     assert result.stuck_state.current_screenshot == base64.b64encode(b"png")
     assert result.evidence["escalation_context"]["artifact_id"] == artifact.id
+    assert result.escalation_request is not None and result.escalation_request.last_action["pending"] is True
+    saved = tmp_path / "evidence" / "escalations" / f"{result.escalation_request.escalation_id}.json"
+    assert load_escalation_request(str(saved)) == result.escalation_request
     assert all(item.args[0] != "https://banking.example.com/transfer" for item in driver.get.call_args_list)
 
 
@@ -137,7 +145,7 @@ def test_ambiguous_click_pauses(driver: Mock, artifact: AutomationArtifact) -> N
     two.is_displayed.return_value = True
     driver.find_elements.side_effect = lambda by, value: [one, two] if (by, value) == (By.ID, "search") else []
     result = replay_artifact(driver, artifact, {"member_id": "12345"})
-    assert result.status == "recoverable_error" and result.step_failed == 3
+    assert result.status == "escalated" and result.step_failed == 3
     assert result.stuck_state is not None and result.stuck_state.reason == "Ambiguous state - multiple matches"
     assert result.outputs == {}
 
@@ -145,8 +153,18 @@ def test_ambiguous_click_pauses(driver: Mock, artifact: AutomationArtifact) -> N
 def test_explicit_help_pauses_before_navigation(driver: Mock, artifact: AutomationArtifact) -> None:
     """An explicit help request leaves the browser untouched by replay actions."""
     result = replay_artifact(driver, artifact, {"member_id": "12345"}, request_human_help=True)
-    assert result.status == "recoverable_error" and result.step_failed == 0
+    assert result.status == "escalated" and result.step_failed == 0
     assert result.stuck_state is not None and result.stuck_state.reason == "Human requested intervention"
+    driver.get.assert_not_called()
+
+
+def test_escalation_write_failure_never_claims_handoff(driver: Mock, artifact: AutomationArtifact) -> None:
+    """If evidence persistence fails, replay stops with a hard failure."""
+    with patch("src.replay.replay_engine.save_escalation_request", side_effect=OSError("read-only directory")):
+        result = replay_artifact(driver, artifact, {"member_id": "12345"}, request_human_help=True)
+    assert result.status == "hard_failure"
+    assert result.escalation_request is None
+    assert result.evidence["escalation_error"] == "OSError"
     driver.get.assert_not_called()
 
 
@@ -159,7 +177,7 @@ def test_repeated_state_pauses_before_extraction(driver: Mock, artifact: Automat
         for index in (1, 2, 3)
     ]
     result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"})
-    assert result.status == "recoverable_error" and result.step_failed == 3
+    assert result.status == "escalated" and result.step_failed == 3
     assert result.stuck_state is not None and result.stuck_state.reason == "Same state repeated - no progress"
     assert result.outputs == {}
 
@@ -278,6 +296,7 @@ def test_failure_on_missing_element_captures_evidence(driver: Mock, artifact: Au
     assert result.evidence["dom"] == "<html>Accounts</html>"
     assert result.evidence["current_url"] == "https://banking.example.com/members/search"
     assert result.evidence["title"] == "Accounts"
+    assert result.escalation_request is not None and result.escalation_request.input_params["member_id"] == "***MEMBER***"
     assert "12345" not in str(result.logs)
 
 

@@ -25,6 +25,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from src.agent.actor import Actor
 from src.artifact.schema import ActionStep, AutomationArtifact, Checkpoint, Locator, OutputField
+from src.escalation.escalation_request import EscalationRequest, create_escalation_request, save_escalation_request
 from src.escalation.stuck_detector import (
     StateTracker,
     StuckState,
@@ -60,7 +61,7 @@ class ReplayResult:
     """Summarize the deterministic replay and its failure evidence."""
 
     success: bool
-    status: Literal["success", "business_outcome", "recoverable_error", "hard_failure"]
+    status: Literal["success", "business_outcome", "recoverable_error", "hard_failure", "escalated"]
     outputs: dict[str, Any] = field(default_factory=dict)
     business_outcome: str | None = None
     error: str | None = None
@@ -69,6 +70,7 @@ class ReplayResult:
     evidence: dict[str, Any] = field(default_factory=dict)
     duration_seconds: float = 0.0
     stuck_state: StuckState | None = None
+    escalation_request: EscalationRequest | None = None
 
 
 def _current_replay_state(driver: WebDriver) -> dict[str, Any]:
@@ -502,7 +504,7 @@ def capture_failure_evidence(driver: WebDriver, step_index: int) -> dict[str, An
 
 def replay_artifact(
     driver: WebDriver, artifact: AutomationArtifact, input_params: dict[str, Any], max_wait_ms: int = 10000,
-    *, request_human_help: bool = False,
+    *, request_human_help: bool = False, escalation_directory: str | None = None,
 ) -> ReplayResult:
     """Validate, navigate, execute, verify, and extract an artifact without Claude.
 
@@ -512,6 +514,8 @@ def replay_artifact(
         input_params: Named values for declared parameters.
         max_wait_ms: Maximum wait per step or checkpoint, in milliseconds.
         request_human_help: Pause before navigation for explicit human help.
+        escalation_directory: Directory for private evidence files; defaults to
+            ESCALATION_DIRECTORY or evidence/escalations.
 
     Returns:
         Replay result with outputs or a hard failure and browser evidence.
@@ -526,6 +530,9 @@ def replay_artifact(
         raise ValidationError("max_wait_ms must be a positive integer")
     if not isinstance(request_human_help, bool):
         raise ValidationError("request_human_help must be a boolean")
+    directory = escalation_directory if escalation_directory is not None else os.environ.get("ESCALATION_DIRECTORY", "evidence/escalations")
+    if not isinstance(directory, str) or not directory.strip():
+        raise ValidationError("escalation_directory must be a nonempty path")
     try:
         recovery_limit = int(os.environ.get("REPLAY_MAX_RECOVERY_RETRIES", "1"))
         if recovery_limit < 0:
@@ -543,6 +550,39 @@ def replay_artifact(
     LOGGER.info("replay_inputs_valid", extra={"event": "replay_inputs_valid", "artifact_id": artifact.id, "input_count": len(input_params)})
     tracker = StateTracker()
     step_history: list[dict[str, Any]] = []
+
+    def build_escalation(stuck: StuckState, *, pending: bool) -> EscalationRequest:
+        """Persist a human handoff before returning a paused result.
+
+        Args:
+            stuck: Hydrated detector state.
+            pending: Whether the identified step has not been executed.
+
+        Returns:
+            Saved escalation request.
+        """
+        current = stuck.current_step
+        if 1 <= current <= len(artifact.steps):
+            action_step = artifact.steps[current - 1]
+            action: dict[str, Any] = {"step_number": current, "action": action_step.action,
+                                       "reasoning": action_step.reasoning, "pending": pending}
+            if action_step.locator:
+                action["locator"] = {"strategy": action_step.locator.strategy,
+                                     "value": action_step.locator.value}
+        elif current == 0:
+            action = {"step_number": 0, "action": "navigate", "pending": pending}
+        else:
+            action = {"step_number": current, "action": "checkpoint", "pending": pending}
+        session = getattr(driver, "session_id", None)
+        request = create_escalation_request(
+            artifact_id=artifact.id, discovery_run_id=artifact.discovery_run_id,
+            stuck_state=stuck, current_session_id=session if isinstance(session, str) and session else "unavailable",
+            goal=artifact.description, last_action=action,
+            previous_steps=[entry.copy() for entry in step_history if entry.get("step_number", 0) < current or not pending],
+            input_params=input_params,
+        )
+        save_escalation_request(request, str(os.path.join(directory, f"{request.escalation_id}.json")))
+        return request
 
     def hydrate_stuck(stuck: StuckState, step_index: int) -> StuckState:
         """Add browser evidence and recent safe actions to a detector decision.
@@ -569,7 +609,7 @@ def replay_artifact(
             step_index: Zero-based last executed step.
 
         Returns:
-            Recoverable result with the complete escalation snapshot.
+            Escalated result when persisted, or a hard failure on save error.
         """
         hydrated = hydrate_stuck(stuck, step_index)
         logs.append(f"Step {hydrated.current_step}: {hydrated.reason}")
@@ -578,9 +618,20 @@ def replay_artifact(
                     "dom": hydrated.current_dom,
                     "current_url": hydrated.escalation_context.get("current_url"),
                     "escalation_context": hydrated.escalation_context}
-        return ReplayResult(success=False, status="recoverable_error", error=hydrated.reason,
+        try:
+            request = build_escalation(hydrated, pending=hydrated.reason in {
+                "Risky action requires human approval", "Ambiguous state - multiple matches", "Human requested intervention"
+            })
+        except (OSError, ValueError, TypeError) as exc:
+            LOGGER.error("escalation_save_failed", extra={"event": "escalation_save_failed", "artifact_id": artifact.id,
+                                                   "error_type": type(exc).__name__})
+            evidence["escalation_error"] = type(exc).__name__
+            return ReplayResult(success=False, status="hard_failure", error=f"Escalation persistence failed: {type(exc).__name__}",
+                                step_failed=hydrated.current_step, logs=logs, evidence=evidence,
+                                duration_seconds=time.monotonic() - started, stuck_state=hydrated)
+        return ReplayResult(success=False, status="escalated", error=hydrated.reason,
                             step_failed=hydrated.current_step, logs=logs, evidence=evidence,
-                            duration_seconds=time.monotonic() - started, stuck_state=hydrated)
+                            duration_seconds=time.monotonic() - started, stuck_state=hydrated, escalation_request=request)
 
     def failure(step_number: int, message: str, checkpoint_evidence: dict[str, Any] | None = None) -> ReplayResult:
         """Build a hard failure with safely summarized diagnostics.
@@ -603,9 +654,16 @@ def replay_artifact(
         stuck = detect_stuck_state(artifact, step_number - 1, state, {"classification": "hard_failure"}, tracker.get_history())
         hydrated = hydrate_stuck(stuck, step_number - 1)
         evidence["escalation_context"] = hydrated.escalation_context
+        request: EscalationRequest | None = None
+        try:
+            request = build_escalation(hydrated, pending=True)
+        except (OSError, ValueError, TypeError) as exc:
+            LOGGER.error("escalation_save_failed", extra={"event": "escalation_save_failed", "artifact_id": artifact.id,
+                                                   "error_type": type(exc).__name__})
+            evidence["escalation_error"] = type(exc).__name__
         return ReplayResult(success=False, status="hard_failure", error=message, step_failed=step_number,
                             logs=logs, evidence=evidence,
-                            duration_seconds=time.monotonic() - started, stuck_state=hydrated)
+                            duration_seconds=time.monotonic() - started, stuck_state=hydrated, escalation_request=request)
 
     def business_outcome(step_number: int, classification: ErrorClassification) -> ReplayResult:
         """Return a legitimate negative business result separately from failures.
