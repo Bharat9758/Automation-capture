@@ -21,6 +21,7 @@ from selenium.webdriver.remote.webelement import WebElement
 
 from src.artifact.schema import ActionStep, AutomationArtifact, Locator, OutputField
 from src.escalation.escalation_request import load_escalation_request
+from src.escalation.human_handoff import HumanAction, SessionManager, record_human_actions
 from src.replay.checkpoint import CheckpointVerificationError
 from src.replay.replay_engine import (
     ValidationError,
@@ -77,6 +78,7 @@ def driver(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Mock:
     """
     monkeypatch.setenv("ALLOWED_DOMAINS", "banking.example.com")
     monkeypatch.setenv("ESCALATION_DIRECTORY", str(tmp_path / "evidence" / "escalations"))
+    monkeypatch.setenv("HANDOFF_DIRECTORY", str(tmp_path / "evidence" / "handoffs"))
     browser = Mock(spec=WebDriver)
     browser.session_id = "session-test"
     browser.current_url = "https://banking.example.com/app"
@@ -166,6 +168,39 @@ def test_escalation_write_failure_never_claims_handoff(driver: Mock, artifact: A
     assert result.escalation_request is None
     assert result.evidence["escalation_error"] == "OSError"
     driver.get.assert_not_called()
+
+
+def test_resume_after_human_action_uses_same_browser(driver: Mock, artifact: AutomationArtifact) -> None:
+    """Manual completion of a risky click resumes at the next step without login."""
+    from datetime import datetime, timezone
+
+    payload = artifact.to_dict()
+    payload["steps"][2]["reasoning"] = "Transfer funds"
+    risky = AutomationArtifact.from_dict(payload)
+    escalated = replay_artifact(driver, risky, {"member_id": "12345"})
+    session = escalated.handoff_session
+    assert escalated.status == "escalated" and session is not None
+    assert session.driver is driver and session.in_control == "paused" and session.paused_step == 3
+    manager = SessionManager()
+    with pytest.raises(ValidationError, match="human-approved"):
+        replay_artifact(driver, risky, {"member_id": "12345"}, handoff_session=session)
+    manager.give_control_to_human(session)
+    record_human_actions(session, [HumanAction(
+        action="click", locator={"strategy": "id", "value": "search"}, value=None,
+        reasoning="Operator completed reviewed click", timestamp=datetime.now(timezone.utc).isoformat(),
+        operator_id="human-1",
+    )])
+    manager.approve_resume(session, resume_step=4)
+    manager.give_control_to_automation(session)
+    before_navigation = driver.get.call_count
+    with patch("src.replay.replay_engine.execute_action", wraps=execute_action) as executed:
+        resumed = replay_artifact(driver, risky, {"member_id": "12345"}, handoff_session=session)
+    assert resumed.success and resumed.outputs == {"savings_balance": 5000}
+    assert driver.get.call_count == before_navigation
+    assert all(item.args[1].step_number == 4 for item in executed.call_args_list)
+    assert resumed.updated_artifact is not None
+    assert resumed.updated_artifact.human_interventions[0].at_step == 3
+    assert risky.human_interventions == []
 
 
 def test_repeated_state_pauses_before_extraction(driver: Mock, artifact: AutomationArtifact) -> None:

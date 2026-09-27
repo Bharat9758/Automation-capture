@@ -54,6 +54,7 @@ def artifact_data() -> dict[str, Any]:
         "known_errors": {"session_expired": {"retryable": False, "message": "Sign in again"}},
         "discovery_run_id": "run-42",
         "success_rate": 0.9,
+        "human_interventions": [],
     }
 
 

@@ -7,7 +7,7 @@ import json
 import os
 import uuid
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -134,7 +134,8 @@ def test_atomic_save_load_and_sort(tmp_path: Path, escalation_record: Escalation
     assert load_escalation_request(str(one)) == escalation_record
     if os.name == "posix":
         assert one.stat().st_mode & 0o777 == 0o600
-    later = replace(escalation_record, escalation_id=str(uuid.uuid4()), timestamp="2026-09-25T12:00:00Z")
+    later = replace(escalation_record, escalation_id=str(uuid.uuid4()),
+                    timestamp=(datetime.now(timezone.utc) + timedelta(days=1)).isoformat())
     save_escalation_request(later, str(directory / f"{later.escalation_id}.json"))
     assert list_escalation_requests(str(directory))[0].escalation_id == later.escalation_id
     with pytest.raises(FileNotFoundError, match="not found"):

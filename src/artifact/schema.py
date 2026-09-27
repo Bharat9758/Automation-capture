@@ -140,6 +140,31 @@ class OutputField:
 
 
 @dataclass(config=_CONFIG, kw_only=True)
+class HumanIntervention:
+    """Redacted, reviewable record of a human browser intervention."""
+
+    at_step: int = Field(ge=0, strict=True)
+    reason: str = Field(min_length=1)
+    human_actions: list[dict[str, Any]]
+    timestamp: str = Field(json_schema_extra={"format": "date-time"})
+    operator_id: str = Field(min_length=1)
+
+    @field_validator("timestamp")
+    @classmethod
+    def check_timestamp(cls, value: str) -> str:
+        """Require a timezone-aware intervention timestamp.
+
+        Args:
+            value: Candidate timestamp.
+
+        Returns:
+            Original timestamp after validation.
+        """
+        _timestamp(value)
+        return value
+
+
+@dataclass(config=_CONFIG, kw_only=True)
 class AutomationArtifact:
     """Reusable, versioned workflow with inputs, outputs, and checkpoints."""
 
@@ -158,6 +183,7 @@ class AutomationArtifact:
     known_errors: dict[str, dict[str, Any]]
     discovery_run_id: str = Field(min_length=1)
     success_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    human_interventions: list[HumanIntervention] = Field(default_factory=list)
 
     @field_validator("version")
     @classmethod

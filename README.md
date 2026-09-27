@@ -1,6 +1,6 @@
 # AutomationCapture
 
-AutomationCapture discovers browser workflows with a Claude-guided Selenium agent and records reusable artifacts for later deterministic replay. Phases 2 through 10 add page observation, browser actions, a bounded discovery loop, a versioned artifact schema, recording, JSON file persistence, robust locator resolution, deterministic replay, runtime outcome classification, checkpoint verification, and stuck state detection. The human handoff and Flask target application will be implemented in later phases.
+AutomationCapture discovers browser workflows with a Claude-guided Selenium agent and records reusable artifacts for later deterministic replay. Phases 2 through 12 add page observation, browser actions, a bounded discovery loop, a versioned artifact schema, recording, JSON file persistence, robust locator resolution, deterministic replay, runtime outcome classification, checkpoint verification, stuck state detection, escalation requests, and a mock human handoff. The Flask target application will be implemented in later phases.
 
 ## Development setup
 
@@ -94,4 +94,28 @@ A pause returns `ReplayResult(status="escalated", success=False, stuck_state=...
 
 Replay saves one JSON request per pause to `ESCALATION_DIRECTORY` (default `evidence/escalations`). Each request contains a UUID, UTC timestamp, artifact and discovery IDs, session ID, last action, prior successful steps, reason, recommendation, screenshot, and DOM. `escalation_directory=` can override the destination per replay call. Input values are masked in `input_params` and human-facing metadata; screenshots and DOM remain raw browser evidence and must be stored and shared carefully. Files are written atomically with owner-only permissions on POSIX systems, and the default evidence directory is excluded from Git. If evidence is incomplete or cannot be saved, a pause returns a hard failure with `evidence["escalation_error"]`; it is never reported as a completed human handoff.
 
-Use `create_escalation_request(...)` directly for other callers, `escalation_to_json`/`json_to_escalation` for JSON conversion, and `save_escalation_request`/`load_escalation_request`/`list_escalation_requests` for persistence. `get_available_elements` suggests controls from a static DOM snapshot; it cannot determine computed CSS visibility. Phase 12 will provide the human interaction workflow; saving a request does not notify an operator or authorize resuming a risky action.
+Use `create_escalation_request(...)` directly for other callers, `escalation_to_json`/`json_to_escalation` for JSON conversion, and `save_escalation_request`/`load_escalation_request`/`list_escalation_requests` for persistence. `get_available_elements` suggests controls from a static DOM snapshot; it cannot determine computed CSS visibility. Saving a request does not notify an operator or authorize resuming a risky action.
+
+## Human handoff and resume
+
+`ReplayResult.handoff_session` is a paused session retaining the original WebDriver object. Replay saves a JSON snapshot of the control state to `HANDOFF_DIRECTORY` (default `evidence/handoffs`). The snapshot excludes the driver; `load_handoff_session(path)` returns a detached record that cannot operate the browser. Reattach only with `load_handoff_session(path, original_driver)` while that exact session is still live. No browser is created from the session ID.
+
+```python
+from src.escalation.human_handoff import SessionManager, MockOperatorInterface, save_handoff_session
+
+paused = replay_artifact(driver, artifact, inputs)
+session = paused.handoff_session  # Only present when a live handoff was created.
+manager = SessionManager()
+manager.give_control_to_human(session)
+operator = MockOperatorInterface(operator_id="operator_1", actions=prepared_human_actions)
+operator.take_control(driver, paused.escalation_request, session)
+# An authorized human reviews the result and explicitly chooses the next pending step.
+operator.confirm_resume()
+if operator.signal_resume():
+    manager.approve_resume(session, resume_step=paused.step_failed + 1)
+    manager.give_control_to_automation(session)
+    save_handoff_session(session, "evidence/handoffs/approved.json")
+    resumed = replay_artifact(driver, artifact, inputs, handoff_session=session)
+```
+
+The mock runs only the supplied actions; it does not approve or resume automatically. For a risky click completed by the operator, select the **next** pending step. Replaying the same risky step can escalate again. Replay verifies the artifact ID, browser object, session ID, and human approval, skips already completed steps and initial navigation, and still verifies the final checkpoint. Successful resumed results include `updated_artifact` with redacted human intervention records; save it explicitly if you want to replace the recorded artifact. `HumanAction.value` for typing is masked in saved audits. Save the session again after control changes to persist its latest state. The mock offers no remote viewing or operator authentication; these belong to later phases.
