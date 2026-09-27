@@ -1,6 +1,6 @@
 # AutomationCapture
 
-AutomationCapture discovers browser workflows with a Claude-guided Selenium agent and records reusable artifacts for later deterministic replay. Phases 2 through 12 add page observation, browser actions, a bounded discovery loop, a versioned artifact schema, recording, JSON file persistence, robust locator resolution, deterministic replay, runtime outcome classification, checkpoint verification, stuck state detection, escalation requests, and a mock human handoff. The Flask target application will be implemented in later phases.
+AutomationCapture discovers browser workflows with a Claude-guided Selenium agent and records reusable artifacts for later deterministic replay. Phases 2 through 13 add page observation, browser actions, a bounded discovery loop, a versioned artifact schema, recording, JSON file persistence, robust locator resolution, deterministic replay, runtime outcome classification, checkpoint verification, stuck state detection, escalation requests, a mock human handoff, and session lifecycle tracking. The Flask target application will be implemented in later phases.
 
 ## Development setup
 
@@ -119,3 +119,11 @@ if operator.signal_resume():
 ```
 
 The mock runs only the supplied actions; it does not approve or resume automatically. For a risky click completed by the operator, select the **next** pending step. Replaying the same risky step can escalate again. Replay verifies the artifact ID, browser object, session ID, and human approval, skips already completed steps and initial navigation, and still verifies the final checkpoint. Successful resumed results include `updated_artifact` with redacted human intervention records; save it explicitly if you want to replace the recorded artifact. `HumanAction.value` for typing is masked in saved audits. Save the session again after control changes to persist its latest state. The mock offers no remote viewing or operator authentication; these belong to later phases.
+
+## Session lifecycle
+
+Every `replay_artifact` run creates a UUID-based `ReplayResult.session` on the original Selenium driver. `SessionLifecycleManager` tracks `created → running → paused → human_control → resumed → completed` as well as failed and abandoned outcomes; the Phase 12 `SessionManager` remains responsible for the separate control transfer. The lifecycle stores step timings and success flags, escalation records, total human actions, duration, and final outputs. Saved JSON is written atomically to `SESSION_DIRECTORY` (default `evidence/sessions`) when a run pauses or reaches a terminal state. Raw input values are never stored in lifecycle metadata, but nested escalation browser evidence and outputs can be sensitive.
+
+On resume, pass the approved `handoff_session` to `replay_artifact`. It loads its matching lifecycle record, verifies the artifact and original live driver, and continues the same run ID. You may also pass `lifecycle_session=` to use an in-memory record. `load_session_metadata(path)` returns a detached audit; `load_session_metadata(path, original_driver)` reattaches the live browser after verifying its Selenium session ID. Saving a session cannot restore a browser that has closed.
+
+`list_sessions()` lists saved audits newest first. `cleanup_old_sessions(directory, days=None)` removes only **terminal** lifecycle JSON files older than the configured `SESSION_RETENTION_DAYS` (default 30). It leaves paused/running records, handoff files, and escalation evidence intact. Use `get_session_summary`, `get_full_session_report`, and `calculate_session_metrics` for reports without duplicating screenshots.

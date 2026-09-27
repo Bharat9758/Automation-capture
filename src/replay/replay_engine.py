@@ -29,6 +29,9 @@ from src.escalation.escalation_request import EscalationRequest, create_escalati
 from src.escalation.human_handoff import (
     HandoffSession, SessionManager, merge_human_actions_into_artifact, save_handoff_session,
 )
+from src.escalation.session_manager import (
+    SessionLifecycle, SessionLifecycleManager, SessionMetadata, load_session_metadata, save_session_metadata,
+)
 from src.escalation.stuck_detector import (
     StateTracker,
     StuckState,
@@ -76,6 +79,7 @@ class ReplayResult:
     escalation_request: EscalationRequest | None = None
     handoff_session: HandoffSession | None = None
     updated_artifact: AutomationArtifact | None = None
+    session: SessionMetadata | None = None
 
 
 def _current_replay_state(driver: WebDriver) -> dict[str, Any]:
@@ -510,7 +514,7 @@ def capture_failure_evidence(driver: WebDriver, step_index: int) -> dict[str, An
 def replay_artifact(
     driver: WebDriver, artifact: AutomationArtifact, input_params: dict[str, Any], max_wait_ms: int = 10000,
     *, request_human_help: bool = False, escalation_directory: str | None = None,
-    handoff_session: HandoffSession | None = None,
+    handoff_session: HandoffSession | None = None, lifecycle_session: SessionMetadata | None = None,
 ) -> ReplayResult:
     """Validate, navigate, execute, verify, and extract an artifact without Claude.
 
@@ -524,6 +528,8 @@ def replay_artifact(
             ESCALATION_DIRECTORY or evidence/escalations.
         handoff_session: Explicitly approved live session for resuming without
             opening a new browser or rerunning completed steps.
+        lifecycle_session: Existing run lifecycle on resume, if held in memory.
+            When omitted, it is loaded from SESSION_DIRECTORY by handoff ID.
 
     Returns:
         Replay result with outputs or a hard failure and browser evidence.
@@ -556,6 +562,59 @@ def replay_artifact(
     except ValueError as exc:
         raise ValidationError("REPLAY_MAX_RECOVERY_RETRIES must be a nonnegative integer") from exc
     _validate_inputs(artifact, input_params)
+    session_manager = SessionLifecycleManager()
+    session_directory = os.environ.get("SESSION_DIRECTORY", "evidence/sessions")
+    if not session_directory:
+        raise ValidationError("SESSION_DIRECTORY must be a nonempty path")
+    if handoff_session is None:
+        if lifecycle_session is not None:
+            raise ValidationError("lifecycle_session requires a handoff_session on replay resume")
+        lifecycle_session = session_manager.create_session(artifact.id, driver, input_params)
+        session_manager.start_session(lifecycle_session)
+    else:
+        if lifecycle_session is None:
+            if not handoff_session.lifecycle_id:
+                raise ValidationError("Handoff has no associated lifecycle ID")
+            lifecycle_session = load_session_metadata(
+                os.path.join(session_directory, f"{handoff_session.lifecycle_id}.json"), driver)
+        if (lifecycle_session.driver_instance is not driver or lifecycle_session.artifact_id != artifact.id
+                or lifecycle_session.session_id != handoff_session.lifecycle_id
+                or lifecycle_session.webdriver_session_id != handoff_session.session_id
+                or not any(item.escalation_id == handoff_session.escalation_id for item in lifecycle_session.escalations)
+                or lifecycle_session.lifecycle_state not in {SessionLifecycle.PAUSED, SessionLifecycle.HUMAN_CONTROL}):
+            raise ValidationError("Lifecycle does not match the approved browser handoff")
+        if lifecycle_session.lifecycle_state == SessionLifecycle.PAUSED:
+            session_manager.give_control_to_human(
+                lifecycle_session,
+                started_at=handoff_session.human_control_started_at.isoformat()
+                if handoff_session.human_control_started_at else None,
+            )
+        session_manager.resume_session(lifecycle_session, human_actions=len(handoff_session.human_actions))
+    assert lifecycle_session is not None
+    lifecycle = lifecycle_session
+
+    def persist_lifecycle(result: ReplayResult) -> ReplayResult:
+        """Persist a final or paused result and expose its lifecycle record.
+
+        Args:
+            result: Completed phase result.
+
+        Returns:
+            Original result, or a hard failure if the audit cannot be saved.
+        """
+        result.session = lifecycle
+        try:
+            save_session_metadata(lifecycle, os.path.join(session_directory, f"{lifecycle.session_id}.json"))
+        except (OSError, TypeError, ValueError) as exc:
+            LOGGER.error("session_save_failed", extra={"event": "session_save_failed", "artifact_id": artifact.id,
+                                                  "error_type": type(exc).__name__})
+            result.success, result.status = False, "hard_failure"
+            result.error = f"Session persistence failed: {type(exc).__name__}"
+            result.evidence["session_error"] = type(exc).__name__
+            if lifecycle.lifecycle_state not in {SessionLifecycle.FAILED, SessionLifecycle.COMPLETED}:
+                session_manager.fail_session(lifecycle, result.error)
+        return result
+
     if handoff_session is not None:
         artifact = merge_human_actions_into_artifact(
             artifact, handoff_session.human_actions, at_step=handoff_session.paused_step,
@@ -586,6 +645,7 @@ def replay_artifact(
             driver, request.escalation_id, session_id, resume_step=request.current_step,
             artifact_id=artifact.id,
         )
+        session.lifecycle_id = lifecycle.session_id
         handoff_dir = os.environ.get("HANDOFF_DIRECTORY", "evidence/handoffs")
         save_handoff_session(session, os.path.join(handoff_dir, f"{request.escalation_id}.json"))
         return session
@@ -662,17 +722,19 @@ def replay_artifact(
                 "Risky action requires human approval", "Ambiguous state - multiple matches", "Human requested intervention"
             })
             handoff = create_handoff(request)
+            session_manager.pause_session(lifecycle, request)
         except (OSError, ValueError, TypeError) as exc:
             LOGGER.error("escalation_save_failed", extra={"event": "escalation_save_failed", "artifact_id": artifact.id,
                                                    "error_type": type(exc).__name__})
             evidence["escalation_error"] = type(exc).__name__
-            return ReplayResult(success=False, status="hard_failure", error=f"Escalation persistence failed: {type(exc).__name__}",
-                                step_failed=hydrated.current_step, logs=logs, evidence=evidence,
-                                duration_seconds=time.monotonic() - started, stuck_state=hydrated)
-        return ReplayResult(success=False, status="escalated", error=hydrated.reason,
+            session_manager.fail_session(lifecycle, f"Escalation persistence failed: {type(exc).__name__}")
+            return persist_lifecycle(ReplayResult(success=False, status="hard_failure", error=f"Escalation persistence failed: {type(exc).__name__}",
+                                                 step_failed=hydrated.current_step, logs=logs, evidence=evidence,
+                                                 duration_seconds=time.monotonic() - started, stuck_state=hydrated))
+        return persist_lifecycle(ReplayResult(success=False, status="escalated", error=hydrated.reason,
                             step_failed=hydrated.current_step, logs=logs, evidence=evidence,
                             duration_seconds=time.monotonic() - started, stuck_state=hydrated,
-                            escalation_request=request, handoff_session=handoff)
+                            escalation_request=request, handoff_session=handoff))
 
     def failure(step_number: int, message: str, checkpoint_evidence: dict[str, Any] | None = None) -> ReplayResult:
         """Build a hard failure with safely summarized diagnostics.
@@ -700,14 +762,16 @@ def replay_artifact(
         try:
             request = build_escalation(hydrated, pending=True)
             handoff = create_handoff(request)
+            session_manager.add_escalation_to_session(lifecycle, request)
         except (OSError, ValueError, TypeError) as exc:
             LOGGER.error("escalation_save_failed", extra={"event": "escalation_save_failed", "artifact_id": artifact.id,
                                                    "error_type": type(exc).__name__})
             evidence["escalation_error"] = type(exc).__name__
-        return ReplayResult(success=False, status="hard_failure", error=message, step_failed=step_number,
+        session_manager.fail_session(lifecycle, message)
+        return persist_lifecycle(ReplayResult(success=False, status="hard_failure", error=message, step_failed=step_number,
                             logs=logs, evidence=evidence,
                             duration_seconds=time.monotonic() - started, stuck_state=hydrated,
-                            escalation_request=request, handoff_session=handoff)
+                            escalation_request=request, handoff_session=handoff))
 
     def business_outcome(step_number: int, classification: ErrorClassification) -> ReplayResult:
         """Return a legitimate negative business result separately from failures.
@@ -721,8 +785,9 @@ def replay_artifact(
         """
         logs.append(f"Step {step_number}: business outcome {classification.business_outcome}")
         LOGGER.info("replay_business_outcome", extra={"event": "replay_business_outcome", "artifact_id": artifact.id, "step": step_number, "business_outcome": classification.business_outcome})
-        return ReplayResult(success=False, status="business_outcome", business_outcome=classification.business_outcome,
-                            logs=logs, duration_seconds=time.monotonic() - started)
+        session_manager.complete_session(lifecycle, outcome=classification.business_outcome or "business_outcome")
+        return persist_lifecycle(ReplayResult(success=False, status="business_outcome", business_outcome=classification.business_outcome,
+                                             logs=logs, duration_seconds=time.monotonic() - started))
 
     def maybe_recover(
         step_number: int, classification: ErrorClassification, resolver: LocatorResolver,
@@ -771,6 +836,7 @@ def replay_artifact(
     for step in steps:
         if handoff_session is not None and step.step_number < handoff_session.resume_step:
             continue
+        step_started = time.monotonic()
         timeout_ms = min(max_wait_ms, step.timeout_ms or max_wait_ms)
         resolver = LocatorResolver(wait_timeout=timeout_ms / 1000)
         if step.action == "click" and step.locator is not None:
@@ -792,6 +858,7 @@ def replay_artifact(
             except (ElementNotFoundError, WebDriverException, ValueError) as exc:
                 classification = detect_and_classify_error(driver, artifact, step.step_number, exc)
                 if classification.classification == "expected_business_outcome":
+                    session_manager.track_step_execution(lifecycle, step.step_number, False, round((time.monotonic() - step_started) * 1000))
                     return business_outcome(step.step_number, classification)
                 if maybe_recover(step.step_number, classification, resolver, attempt, step.action in _IMPLICIT_RETRY_ACTIONS and phase == "action"):
                     continue
@@ -801,10 +868,12 @@ def replay_artifact(
                     else f"Outcome check failed: {type(exc).__name__}"
                 )
                 message = classification.error_message if classification.classification == "hard_failure" and classification.error_message and artifact.known_errors else default
+                session_manager.track_step_execution(lifecycle, step.step_number, False, round((time.monotonic() - step_started) * 1000))
                 return failure(step.step_number, message)
             logs.append(f"Step {step.step_number}: {step.action} succeeded in {action_result['duration_ms']} ms")
             break
         record_step_in_history(step_history, {"step_number": step.step_number, "action": step.action, "success": True})
+        session_manager.track_step_execution(lifecycle, step.step_number, True, round((time.monotonic() - step_started) * 1000))
         if step.action in {"navigate", "click", "wait", "checkpoint"}:
             state = _current_replay_state(driver)
             decision = detect_stuck_state(artifact, step.step_number - 1, state, {}, tracker.get_history())
@@ -863,5 +932,6 @@ def replay_artifact(
         LOGGER.info("replay_output", extra={"event": "replay_output", "artifact_id": artifact.id, "field": output.name})
     duration = time.monotonic() - started
     LOGGER.info("replay_completed", extra={"event": "replay_completed", "artifact_id": artifact.id, "duration_seconds": duration, "output_count": len(outputs)})
-    return ReplayResult(success=True, status="success", outputs=outputs, logs=logs,
-                        duration_seconds=duration, updated_artifact=artifact if handoff_session is not None else None)
+    session_manager.complete_session(lifecycle, outputs)
+    return persist_lifecycle(ReplayResult(success=True, status="success", outputs=outputs, logs=logs,
+                                         duration_seconds=duration, updated_artifact=artifact if handoff_session is not None else None))

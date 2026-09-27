@@ -92,6 +92,8 @@ class HandoffSession:
     resume_step: int = 0
     paused_step: int = 0
     artifact_id: str = ""
+    lifecycle_id: str = ""
+    human_control_started_at: datetime | None = None
 
 
 def _require_driver(session: HandoffSession) -> WebDriver:
@@ -171,6 +173,7 @@ class SessionManager:
         if session.in_control != "paused":
             raise RuntimeError("Only a paused session can be handed to a human")
         session.in_control, session.in_control_since = "human", _now()
+        session.human_control_started_at = session.in_control_since
         LOGGER.info("handoff_human_control", extra={"event": "handoff_human_control", "escalation_id": session.escalation_id})
         return session
 
@@ -460,7 +463,8 @@ def save_handoff_session(session: HandoffSession, filepath: str) -> str:
                "started_at": session.started_at.isoformat(), "paused_at": session.paused_at.isoformat(),
                "automation_can_resume": session.automation_can_resume,
                "resume_step": session.resume_step, "paused_step": session.paused_step,
-               "artifact_id": session.artifact_id,
+               "artifact_id": session.artifact_id, "lifecycle_id": session.lifecycle_id,
+               "human_control_started_at": session.human_control_started_at.isoformat() if session.human_control_started_at else None,
                "human_actions": [{**asdict(item), "value": "***REDACTED***" if item.action == "type" else item.value}
                                  for item in session.human_actions]}
     target = Path(filepath)
@@ -512,7 +516,8 @@ def load_handoff_session(filepath: str, driver: WebDriver | None = None) -> Hand
                                  human_actions=actions, automation_can_resume=data["automation_can_resume"],
                                  started_at=_parse_time(data["started_at"]), paused_at=_parse_time(data["paused_at"]),
                                  resume_step=data["resume_step"], paused_step=data["paused_step"],
-                                 artifact_id=data["artifact_id"])
+                                 artifact_id=data["artifact_id"], lifecycle_id=data.get("lifecycle_id", ""),
+                                 human_control_started_at=_parse_time(data["human_control_started_at"]) if data.get("human_control_started_at") else None)
         if session.in_control not in {"paused", "human", "automation"} or not isinstance(session.automation_can_resume, bool):
             raise ValueError("Invalid handoff control state")
         if (not isinstance(session.session_id, str) or not session.session_id

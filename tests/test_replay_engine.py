@@ -22,6 +22,7 @@ from selenium.webdriver.remote.webelement import WebElement
 from src.artifact.schema import ActionStep, AutomationArtifact, Locator, OutputField
 from src.escalation.escalation_request import load_escalation_request
 from src.escalation.human_handoff import HumanAction, SessionManager, record_human_actions
+from src.escalation.session_manager import SessionLifecycle, load_session_metadata
 from src.replay.checkpoint import CheckpointVerificationError
 from src.replay.replay_engine import (
     ValidationError,
@@ -79,6 +80,7 @@ def driver(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Mock:
     monkeypatch.setenv("ALLOWED_DOMAINS", "banking.example.com")
     monkeypatch.setenv("ESCALATION_DIRECTORY", str(tmp_path / "evidence" / "escalations"))
     monkeypatch.setenv("HANDOFF_DIRECTORY", str(tmp_path / "evidence" / "handoffs"))
+    monkeypatch.setenv("SESSION_DIRECTORY", str(tmp_path / "evidence" / "sessions"))
     browser = Mock(spec=WebDriver)
     browser.session_id = "session-test"
     browser.current_url = "https://banking.example.com/app"
@@ -109,7 +111,7 @@ def driver(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Mock:
     return browser
 
 
-def test_replay_end_to_end_without_llm(driver: Mock, artifact: AutomationArtifact) -> None:
+def test_replay_end_to_end_without_llm(driver: Mock, artifact: AutomationArtifact, tmp_path: Path) -> None:
     """Inputs flow through navigation, typing, clicking, checkpoint, and output."""
     result = replay_artifact(driver, artifact, {"member_id": "12345"})
 
@@ -121,6 +123,10 @@ def test_replay_end_to_end_without_llm(driver: Mock, artifact: AutomationArtifac
     assert all("12345" not in message and "5,000" not in message for message in result.logs)
     assert driver.get.call_args_list == [call("https://banking.example.com/app"), call("https://banking.example.com/members/search")]
     assert "12345" not in str(artifact.to_dict())
+    assert result.session is not None and result.session.lifecycle_state == SessionLifecycle.COMPLETED
+    assert len(result.session.step_executions) == len(artifact.steps)
+    saved_session = tmp_path / "evidence" / "sessions" / f"{result.session.session_id}.json"
+    assert load_session_metadata(str(saved_session)).lifecycle_state == SessionLifecycle.COMPLETED
 
 
 def test_risky_click_pauses_before_execution(driver: Mock, artifact: AutomationArtifact, tmp_path: Path) -> None:
@@ -134,6 +140,8 @@ def test_risky_click_pauses_before_execution(driver: Mock, artifact: AutomationA
     assert result.stuck_state.current_screenshot == base64.b64encode(b"png")
     assert result.evidence["escalation_context"]["artifact_id"] == artifact.id
     assert result.escalation_request is not None and result.escalation_request.last_action["pending"] is True
+    assert result.session is not None and result.session.lifecycle_state == SessionLifecycle.PAUSED
+    assert result.handoff_session is not None and result.handoff_session.lifecycle_id == result.session.session_id
     saved = tmp_path / "evidence" / "escalations" / f"{result.escalation_request.escalation_id}.json"
     assert load_escalation_request(str(saved)) == result.escalation_request
     assert all(item.args[0] != "https://banking.example.com/transfer" for item in driver.get.call_args_list)
@@ -201,6 +209,11 @@ def test_resume_after_human_action_uses_same_browser(driver: Mock, artifact: Aut
     assert resumed.updated_artifact is not None
     assert resumed.updated_artifact.human_interventions[0].at_step == 3
     assert risky.human_interventions == []
+    assert resumed.session is not None and escalated.session is not None
+    assert resumed.session.session_id == escalated.session.session_id
+    assert resumed.session.lifecycle_state == SessionLifecycle.COMPLETED
+    assert resumed.session.human_actions_total == 1
+    assert len(resumed.session.step_executions) == len(risky.steps) - 1
 
 
 def test_repeated_state_pauses_before_extraction(driver: Mock, artifact: AutomationArtifact) -> None:
@@ -326,6 +339,7 @@ def test_failure_on_missing_element_captures_evidence(driver: Mock, artifact: Au
     result = replay_artifact(driver, broken, {"member_id": "12345"}, max_wait_ms=30)
 
     assert result.status == "hard_failure" and result.step_failed == 2
+    assert result.session is not None and result.session.lifecycle_state == SessionLifecycle.FAILED
     assert result.outputs == {} and result.error == "type failed: ElementNotFoundError"
     assert result.evidence["screenshot"] == base64.b64encode(b"png").decode()
     assert result.evidence["dom"] == "<html>Accounts</html>"

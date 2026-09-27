@@ -222,3 +222,6 @@ evidence/escalations/
 
 # Local handoff audits; these can contain page and operator context.
 evidence/handoffs/
+
+# Session lifecycle audits can contain nested browser evidence and outputs.
+evidence/sessions/
