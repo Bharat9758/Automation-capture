@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import json
+import os
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,7 @@ from src.replay.replay_engine import (
     substitute_input_parameters,
     wait_for_outcome,
 )
+from src.safety.allowlist import load_allowlist
 
 
 @pytest.fixture
@@ -81,6 +84,23 @@ def driver(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Mock:
     monkeypatch.setenv("ESCALATION_DIRECTORY", str(tmp_path / "evidence" / "escalations"))
     monkeypatch.setenv("HANDOFF_DIRECTORY", str(tmp_path / "evidence" / "handoffs"))
     monkeypatch.setenv("SESSION_DIRECTORY", str(tmp_path / "evidence" / "sessions"))
+    rules = {"pages": [
+        {"url_pattern": route, "domain": "banking.example.com", "page_name": route, "description": "Test page",
+         "allowed_actions": ["navigate", "click", "type", "read", "wait", "checkpoint"],
+         "allowed_elements": [
+             {"element_id": name, "locator": {"strategy": strategy, "value": name},
+              "action": action, "description": f"Test {name}"}
+             for name, strategy, action in [
+                 ("member-id", "id", "type"), ("search", "id", "click"),
+                 ("balance", "id", "read"), ("missing", "id", "type"),
+                 ("dismiss", "id", "click"), ("missing-dismiss", "id", "click"),
+                 (".result", "css", "read")]
+         ]} for route in ("/app", "/members/search")],
+        "global_forbidden_keywords": ["delete", "remove", "deactivate"],
+        "require_confirmation_for": []}
+    rules_path = tmp_path / "allowlist.json"
+    rules_path.write_text(json.dumps(rules), encoding="utf-8")
+    monkeypatch.setenv("ALLOWLIST_PATH", str(rules_path))
     browser = Mock(spec=WebDriver)
     browser.session_id = "session-test"
     browser.current_url = "https://banking.example.com/app"
@@ -127,6 +147,48 @@ def test_replay_end_to_end_without_llm(driver: Mock, artifact: AutomationArtifac
     assert len(result.session.step_executions) == len(artifact.steps)
     saved_session = tmp_path / "evidence" / "sessions" / f"{result.session.session_id}.json"
     assert load_session_metadata(str(saved_session)).lifecycle_state == SessionLifecycle.COMPLETED
+
+
+def test_missing_allowlist_fails_before_browser_navigation(
+    driver: Mock, artifact: AutomationArtifact, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replay requires reviewed rules and cannot silently use permissive defaults."""
+    monkeypatch.delenv("ALLOWLIST_PATH")
+    with pytest.raises(ValidationError, match="ALLOWLIST_PATH"):
+        replay_artifact(driver, artifact, {"member_id": "12345"})
+    driver.get.assert_not_called()
+
+
+def test_initial_destination_must_be_allowlisted(driver: Mock, artifact: AutomationArtifact) -> None:
+    """A valid domain alone cannot authorize an unreviewed initial path."""
+    payload = artifact.to_dict()
+    payload["target_url"] = "https://banking.example.com/admin"
+    result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"})
+    assert result.status == "hard_failure" and result.step_failed == 0
+    assert "AllowlistViolation" in (result.error or "")
+    driver.get.assert_not_called()
+
+
+def test_unknown_element_is_blocked_before_click(driver: Mock, artifact: AutomationArtifact) -> None:
+    """Recorded but unreviewed locators cannot reach the browser."""
+    payload = artifact.to_dict()
+    payload["steps"][2]["locator"]["value"] = "unapproved-button"
+    result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"})
+    assert result.status == "hard_failure" and result.step_failed == 3
+    assert "Allowlist violation" in (result.error or "")
+    driver.find_element.assert_any_call(By.ID, "member-id")
+    assert not any(args.args == (By.ID, "unapproved-button") for args in driver.find_element.call_args_list)
+
+
+def test_reviewed_confirmation_pauses_before_click(driver: Mock, artifact: AutomationArtifact) -> None:
+    """Confirmation policies use the existing auditable handoff."""
+    payload = artifact.to_dict()
+    payload["steps"][2]["reasoning"] = "Confirm submission"
+    config = load_allowlist(os.environ["ALLOWLIST_PATH"])
+    config.require_confirmation_for.append("confirm")
+    result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"}, allowlist=config)
+    assert result.status == "escalated" and result.step_failed == 3
+    assert result.handoff_session is not None and result.handoff_session.paused_step == 3
 
 
 def test_risky_click_pauses_before_execution(driver: Mock, artifact: AutomationArtifact, tmp_path: Path) -> None:

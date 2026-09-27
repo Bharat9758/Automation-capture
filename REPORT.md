@@ -1,5 +1,7 @@
 # AutomationCapture Project Report
 
+Phase 14 adds a reviewed, fail-closed JSON page and element allowlist to replay. It checks destinations before navigation and checks interaction, recovery, checkpoint, and output targets before use. Forbidden action keywords stop replay; actions requiring confirmation pause for the existing human handoff. The example rules need review and customization before use with another application.
+
 ## 1. Summary
 
 Phases 1 through 13 establish the project structure, a bounded Claude-guided discovery loop, an artifact schema, recording, JSON persistence, locator resolution, deterministic replay, classified outcomes, checkpoint verification, stuck state detection, persisted escalation requests, same-browser human handoff, and lifecycle tracking.

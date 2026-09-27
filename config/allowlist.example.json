@@ -1,0 +1,37 @@
+{
+  "pages": [
+    {
+      "url_pattern": "/members/search",
+      "domain": "banking.example.com",
+      "page_name": "member_search",
+      "description": "Reviewed member search page",
+      "allowed_actions": ["navigate", "type", "click", "read", "wait", "checkpoint"],
+      "allowed_elements": [
+        {
+          "element_id": "search_input",
+          "locator": {"strategy": "id", "value": "member_search_input"},
+          "action": "type",
+          "description": "Member search field",
+          "safe_to_type": true
+        },
+        {
+          "element_id": "search_button",
+          "locator": {"strategy": "id", "value": "search_btn"},
+          "action": "click",
+          "description": "Submit member search",
+          "safe_to_click": true
+        },
+        {
+          "element_id": "balance_display",
+          "locator": {"strategy": "id", "value": "savings_balance_display"},
+          "action": "read",
+          "description": "Savings balance display"
+        }
+      ]
+    }
+  ],
+  "global_forbidden_keywords": ["delete", "close_account", "remove", "transfer", "unsubscribe", "deactivate"],
+  "require_confirmation_for": ["delete", "close", "transfer", "remove"],
+  "allow_new_urls": false,
+  "allow_unknown_elements": false
+}

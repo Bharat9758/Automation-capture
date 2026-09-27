@@ -1,5 +1,11 @@
 # AutomationCapture
 
+## Replay allowlist (Phase 14)
+
+Set `ALLOWLIST_PATH` to a reviewed JSON file for the target application. Copy `config/allowlist.example.json` and edit its exact domains, paths, allowed actions, and element locators. Replay refuses to start if the file is missing or invalid. Every initial or recorded navigation, element action, recovery action, output read, and checkpoint locator is checked. Unapproved redirects stop replay. `ALLOWED_DOMAINS` remains a separate navigation restriction. Exact paths start with `/`; use `regex:<expression>` for a full-path regular expression. Locator fallbacks must also be reviewed.
+
+Global forbidden keywords deny actions. Actions requiring confirmation pause for human review; an operator can perform the step in the existing session and explicitly resume at the next step. Keep `allow_new_urls` and `allow_unknown_elements` false. An optional local bypass requires `ALLOWLIST_MODE=development` and identical nonempty `ALLOWLIST_BYPASS_TOKEN` and `ALLOWLIST_BYPASS_PRESENTED_TOKEN`. Production mode ignores bypass tokens. The example covers only member search; add every target and destination path for other workflows.
+
 AutomationCapture discovers browser workflows with a Claude-guided Selenium agent and records reusable artifacts for later deterministic replay. Phases 2 through 13 add page observation, browser actions, a bounded discovery loop, a versioned artifact schema, recording, JSON file persistence, robust locator resolution, deterministic replay, runtime outcome classification, checkpoint verification, stuck state detection, escalation requests, a mock human handoff, and session lifecycle tracking. The Flask target application will be implemented in later phases.
 
 ## Development setup

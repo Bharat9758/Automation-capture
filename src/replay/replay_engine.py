@@ -50,6 +50,7 @@ from src.replay.error_handler import (
     execute_recovery_action,
 )
 from src.replay.locator_strategy import ElementNotFoundError, LocatorResolver
+from src.safety.allowlist import AllowlistConfig, AllowlistViolation, enforce_allowlist, get_allowed_actions_for_url, is_url_allowed, load_allowlist
 
 
 LOGGER = get_logger(__name__)
@@ -515,6 +516,7 @@ def replay_artifact(
     driver: WebDriver, artifact: AutomationArtifact, input_params: dict[str, Any], max_wait_ms: int = 10000,
     *, request_human_help: bool = False, escalation_directory: str | None = None,
     handoff_session: HandoffSession | None = None, lifecycle_session: SessionMetadata | None = None,
+    allowlist: AllowlistConfig | None = None,
 ) -> ReplayResult:
     """Validate, navigate, execute, verify, and extract an artifact without Claude.
 
@@ -530,6 +532,7 @@ def replay_artifact(
             opening a new browser or rerunning completed steps.
         lifecycle_session: Existing run lifecycle on resume, if held in memory.
             When omitted, it is loaded from SESSION_DIRECTORY by handoff ID.
+        allowlist: Explicit reviewed rules; otherwise load ALLOWLIST_PATH.
 
     Returns:
         Replay result with outputs or a hard failure and browser evidence.
@@ -562,6 +565,16 @@ def replay_artifact(
     except ValueError as exc:
         raise ValidationError("REPLAY_MAX_RECOVERY_RETRIES must be a nonnegative integer") from exc
     _validate_inputs(artifact, input_params)
+    if allowlist is None:
+        allowlist_path = os.environ.get("ALLOWLIST_PATH")
+        if not allowlist_path:
+            raise ValidationError("ALLOWLIST_PATH must point to a reviewed allowlist")
+        try:
+            allowlist = load_allowlist(allowlist_path)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ValidationError(f"Could not load reviewed allowlist: {type(exc).__name__}") from exc
+    if not isinstance(allowlist, AllowlistConfig):
+        raise ValidationError("allowlist must be an AllowlistConfig")
     session_manager = SessionLifecycleManager()
     session_directory = os.environ.get("SESSION_DIRECTORY", "evidence/sessions")
     if not session_directory:
@@ -808,7 +821,23 @@ def replay_artifact(
         if not classification.should_continue or attempt >= recovery_limit:
             return False
         if classification.recovery_action is not None:
+            recovery = classification.recovery_action
+            try:
+                raw_locator = recovery.get("locator")
+                locator = LocatorResolver._coerce_locator(raw_locator) if raw_locator is not None else None
+                recovery_step = ActionStep(step_number=max(1, step_number), action=recovery["action"],
+                                           locator=locator, value=recovery.get("url", recovery.get("value")) if recovery.get("action") == "navigate" else recovery.get("value"),
+                                           reasoning="Recover from the observed condition", expected_outcome="Recovery attempted")
+                enforce_allowlist(driver, recovery_step, artifact, allowlist)
+            except (AllowlistViolation, ValueError, KeyError, TypeError) as exc:
+                LOGGER.warning("replay_recovery_denied", extra={"event": "replay_recovery_denied", "step": step_number,
+                                                       "error_type": type(exc).__name__})
+                logs.append(f"Step {step_number}: recovery action denied by allowlist")
+                return False
             if not execute_recovery_action(driver, classification.recovery_action, resolver):
+                return False
+            if not is_url_allowed(driver.current_url, allowlist):
+                logs.append(f"Step {step_number}: recovery left the allowlist")
                 return False
         elif not implicit_safe:
             return False
@@ -823,10 +852,16 @@ def replay_artifact(
 
     if handoff_session is None or handoff_session.resume_step == 0:
         try:
+            if not is_url_allowed(artifact.target_url, allowlist):
+                raise AllowlistViolation("Initial target URL is not allowlisted", action="navigate", current_url=artifact.target_url)
+            if not allowlist.allow_new_urls and "navigate" not in get_allowed_actions_for_url(artifact.target_url, allowlist):
+                raise AllowlistViolation("Initial navigation is not allowed", action="navigate", current_url=artifact.target_url)
             _navigate(driver, artifact.target_url, max_wait_ms / 1000)
+            if not is_url_allowed(driver.current_url, allowlist):
+                raise AllowlistViolation("Initial navigation redirected outside allowlist", action="navigate", current_url=driver.current_url)
             logs.append("Navigation to artifact target completed")
             LOGGER.info("replay_navigated", extra={"event": "replay_navigated", "artifact_id": artifact.id})
-        except (WebDriverException, ValueError) as exc:
+        except (WebDriverException, ValueError, AllowlistViolation) as exc:
             return failure(0, f"Initial navigation failed: {type(exc).__name__}")
     else:
         logs.append(f"Resumed from step {handoff_session.resume_step} on the original browser session")
@@ -836,6 +871,27 @@ def replay_artifact(
     for step in steps:
         if handoff_session is not None and step.step_number < handoff_session.resume_step:
             continue
+        if step.action == "navigate" and step.value:
+            step = replace(step, value=urljoin(artifact.target_url, step.value))
+        try:
+            enforce_allowlist(driver, step, artifact, allowlist)
+        except AllowlistViolation as exc:
+            if "requires human confirmation" in exc.reason:
+                return pause(StuckState(is_stuck=True, reason="Risky action requires human approval",
+                                        current_step=step.step_number, recommended_action="Review action before proceeding"),
+                             step.step_number - 2)
+            return failure(step.step_number, f"Allowlist violation: {exc.reason}")
+        outcome = step.value if step.action == "checkpoint" else step.expected_outcome
+        condition, delimiter, argument = (outcome or "").partition(":")
+        if delimiter and condition in {"element_visible", "element_count", "text_changed"}:
+            selector = argument.rpartition("=")[0] if condition == "element_count" else argument
+            try:
+                probe = ActionStep(step_number=step.step_number, action="checkpoint",
+                                   locator=Locator(strategy="css", value=selector, robustness_notes="Recorded outcome selector"),
+                                   value=None, reasoning="Check expected outcome", expected_outcome="Outcome observed")
+                enforce_allowlist(driver, probe, artifact, allowlist)
+            except (AllowlistViolation, ValueError) as exc:
+                return failure(step.step_number, f"Outcome selector is not allowlisted: {type(exc).__name__}")
         step_started = time.monotonic()
         timeout_ms = min(max_wait_ms, step.timeout_ms or max_wait_ms)
         resolver = LocatorResolver(wait_timeout=timeout_ms / 1000)
@@ -846,15 +902,17 @@ def replay_artifact(
             decision = detect_stuck_state(artifact, step.step_number - 2, state, {}, tracker.get_history())
             if decision.is_stuck:
                 return pause(decision, step.step_number - 2)
-        if step.action == "navigate" and step.value:
-            step = replace(step, value=urljoin(artifact.target_url, step.value))
         for attempt in range(recovery_limit + 1):
             phase = "action"
             try:
                 action_result = execute_action(driver, step, resolver, raise_on_error=True)
+                if not is_url_allowed(driver.current_url, allowlist):
+                    raise AllowlistViolation("Action left the approved pages", action=step.action, current_url=driver.current_url)
                 phase = "outcome"
                 if not wait_for_outcome(driver, step.expected_outcome, timeout_ms):
                     raise TimeoutException("Expected outcome timed out")
+            except AllowlistViolation as exc:
+                return failure(step.step_number, f"Allowlist violation: {exc.reason}")
             except (ElementNotFoundError, WebDriverException, ValueError) as exc:
                 classification = detect_and_classify_error(driver, artifact, step.step_number, exc)
                 if classification.classification == "expected_business_outcome":
@@ -887,7 +945,15 @@ def replay_artifact(
     verifier = CheckpointVerifier()
     for attempt in range(recovery_limit + 1):
         try:
+            if not is_url_allowed(driver.current_url, allowlist):
+                raise AllowlistViolation("Checkpoint page is not allowlisted", action="checkpoint", current_url=driver.current_url)
+            if checkpoint.locator is not None:
+                guard = ActionStep(step_number=final_index, action="checkpoint", locator=checkpoint.locator,
+                                   value=None, reasoning="Verify success", expected_outcome="Checkpoint passed")
+                enforce_allowlist(driver, guard, artifact, allowlist)
             verifier.verify(driver, checkpoint, final_resolver, timeout=max_wait_ms / 1000, step_number=final_index)
+        except AllowlistViolation as exc:
+            return failure(final_index, f"Allowlist violation: {exc.reason}")
         except (CheckpointVerificationError, ValueError, WebDriverException) as exc:
             classification = detect_and_classify_error(driver, artifact, final_index, exc)
             if classification.classification == "expected_business_outcome":
@@ -918,7 +984,12 @@ def replay_artifact(
         output_resolver = LocatorResolver(wait_timeout=max_wait_ms / 1000)
         for attempt in range(recovery_limit + 1):
             try:
+                guard = ActionStep(step_number=final_index, action="read_text", locator=resolved_output.extraction_locator,
+                                   value=None, reasoning="Extract declared output", expected_outcome="Output read")
+                enforce_allowlist(driver, guard, artifact, allowlist)
                 outputs[output.name] = extract_output(driver, resolved_output, output_resolver)
+            except AllowlistViolation as exc:
+                return failure(final_index, f"Allowlist violation: {exc.reason}")
             except (ElementNotFoundError, WebDriverException, ValueError) as exc:
                 classification = detect_and_classify_error(driver, artifact, final_index, exc)
                 if classification.classification == "expected_business_outcome":
