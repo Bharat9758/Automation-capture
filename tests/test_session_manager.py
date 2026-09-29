@@ -88,7 +88,7 @@ def test_create_start_pause_human_resume_complete(manager: SessionLifecycleManag
     assert metrics["total_duration_seconds"] >= 0 and metrics["reuse_ready"] is False
     assert manager.is_artifact_improvement_candidate(session)
     assert manager.get_session_summary(session)["outcome"] == "success"
-    assert manager.get_full_session_report(session)["outputs"] == {"balance": 100}
+    assert manager.get_full_session_report(session)["outputs"] == {"balance": "***REDACTED***"}
     assert manager.get_full_session_report(session)["risk_assessments"][0]["risk_level"] == "caution"
     assert manager.get_session_escalation_summary(session)["successful_recovery"] is True
     assert manager.get_escalations_for_session(session) == [escalation]
@@ -144,7 +144,9 @@ def test_metadata_roundtrip_listing_and_detached_browser(
     assert load_session_metadata(str(path)).driver_instance is None
     attached = load_session_metadata(str(path), driver)
     assert attached.driver_instance is driver
-    assert attached.escalations[0] == first.escalations[0]
+    assert attached.escalations[0].escalation_id == first.escalations[0].escalation_id
+    assert attached.escalations[0].dom_snapshot == "<redacted>"
+    assert first.escalations[0].dom_snapshot != attached.escalations[0].dom_snapshot
     with pytest.raises(ValueError, match="Invalid session metadata"):
         load_session_metadata(str(path), Mock(session_id="other"))
     second = manager.create_session("sample", driver, {})

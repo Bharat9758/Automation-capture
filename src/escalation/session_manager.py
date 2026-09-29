@@ -451,7 +451,10 @@ class SessionLifecycleManager:
         Returns:
             State, durations, step audit, escalation IDs, and outputs.
         """
+        from src.safety.data_redactor import load_redaction_policy, redact_session_metadata
+
         metrics = self.calculate_session_metrics(session)
+        session = redact_session_metadata(session, load_redaction_policy())
         return {"session_id": session.session_id, "artifact_id": session.artifact_id,
                 "created_at": session.created_at, "started_at": session.started_at,
                 "paused_at": session.paused_at, "resumed_at": session.resumed_at,
@@ -493,6 +496,9 @@ def save_session_metadata(session: SessionMetadata, filepath: str) -> str:
     Returns:
         Destination filepath.
     """
+    from src.safety.data_redactor import load_redaction_policy, redact_session_metadata
+
+    session = redact_session_metadata(session, load_redaction_policy())
     payload: dict[str, Any] = {key: value for key, value in vars(session).items()
                                if key not in {"driver_instance", "escalations"}}
     payload["lifecycle_state"] = session.lifecycle_state.value

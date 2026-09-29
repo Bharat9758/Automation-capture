@@ -317,6 +317,9 @@ def create_escalation_request(
     valid, error = validate_escalation_request(request)
     if not valid:
         raise ValueError(f"Invalid escalation request: {error}")
+    from src.safety.data_redactor import load_redaction_policy, redact_escalation_request
+
+    request = redact_escalation_request(request, load_redaction_policy())
     LOGGER.info("escalation_created", extra={"event": "escalation_created", "escalation_id": request.escalation_id,
                                             "artifact_id": artifact_id, "step": request.current_step})
     return request
@@ -392,7 +395,9 @@ def save_escalation_request(request: EscalationRequest, filepath: str) -> str:
         OSError: If directory creation or write fails.
         ValueError: If the request is invalid.
     """
-    body = escalation_to_json(request)
+    from src.safety.data_redactor import load_redaction_policy, redact_escalation_request
+
+    body = escalation_to_json(redact_escalation_request(request, load_redaction_policy()))
     target = Path(filepath)
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary: str | None = None

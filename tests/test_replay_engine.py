@@ -151,6 +151,7 @@ def test_replay_end_to_end_without_llm(driver: Mock, artifact: AutomationArtifac
     assert result.session.step_executions[1]["risk_level"] == "risky"
     saved_session = tmp_path / "evidence" / "sessions" / f"{result.session.session_id}.json"
     assert load_session_metadata(str(saved_session)).lifecycle_state == SessionLifecycle.COMPLETED
+    assert load_session_metadata(str(saved_session)).outputs == {"savings_balance": "***REDACTED***"}
 
 
 def test_missing_allowlist_fails_before_browser_navigation(
@@ -159,6 +160,17 @@ def test_missing_allowlist_fails_before_browser_navigation(
     """Replay requires reviewed rules and cannot silently use permissive defaults."""
     monkeypatch.delenv("ALLOWLIST_PATH")
     with pytest.raises(ValidationError, match="ALLOWLIST_PATH"):
+        replay_artifact(driver, artifact, {"member_id": "12345"})
+    driver.get.assert_not_called()
+
+
+def test_unsafe_redaction_configuration_blocks_replay_before_navigation(
+    driver: Mock, artifact: AutomationArtifact, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production cannot disable metadata masking and still start Selenium."""
+    monkeypatch.setenv("REDACTION_LEVEL", "NONE")
+    monkeypatch.setenv("ALLOWLIST_MODE", "production")
+    with pytest.raises(ValidationError, match="redaction policy"):
         replay_artifact(driver, artifact, {"member_id": "12345"})
     driver.get.assert_not_called()
 
@@ -471,7 +483,7 @@ def test_extract_output_types(output_type: str, text: str, expected: Any) -> Non
     assert extract_output(Mock(spec=WebDriver), output, resolver) == expected
 
 
-def test_failure_on_missing_element_captures_evidence(driver: Mock, artifact: AutomationArtifact) -> None:
+def test_failure_on_missing_element_captures_evidence(driver: Mock, artifact: AutomationArtifact, tmp_path: Path) -> None:
     """An unresolvable step fails with correct step and browser evidence."""
     payload = artifact.to_dict()
     payload["steps"][1]["locator"]["value"] = "missing"
@@ -487,6 +499,10 @@ def test_failure_on_missing_element_captures_evidence(driver: Mock, artifact: Au
     assert result.evidence["current_url"] == "https://banking.example.com/members/search"
     assert result.evidence["title"] == "Accounts"
     assert result.escalation_request is not None and result.escalation_request.input_params["member_id"] == "***MEMBER***"
+    raw = tmp_path / "evidence" / "escalations" / "raw" / f"{result.escalation_request.escalation_id}.json"
+    assert json.loads(raw.read_text(encoding="utf-8"))["dom_snapshot"] == result.escalation_request.dom_snapshot
+    saved_session = tmp_path / "evidence" / "sessions" / f"{result.session.session_id}.json"
+    assert "<html>Accounts</html>" not in saved_session.read_text(encoding="utf-8")
     assert "12345" not in str(result.logs)
 
 

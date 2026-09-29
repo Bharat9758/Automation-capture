@@ -1,5 +1,13 @@
 # AutomationCapture
 
+## Metadata redaction (Phase 16)
+
+`REDACTION_LEVEL=STRICT` is the default. `BASIC` masks obvious financial and identity fields; `STRICT` also masks names, member IDs, and pattern matches; `PARANOID` retains identifiers, timestamps, states, and metrics while masking other metadata. `NONE` is accepted only when `ALLOWLIST_MODE=development`. Optional `REDACTION_FIELDS` and `REDACTION_PATTERNS` are JSON lists. Malformed policies stop replay before browser actions.
+
+Escalation requests and saved session reports use redacted metadata. Saved session outputs are masked, while the caller's live `ReplayResult.outputs` remains available for the requested workflow. JSON log records are filtered before emission. Screenshots and DOM remain unmodified in private escalation evidence and in the separate owner-only `RAW_EVIDENCE_DIRECTORY`; these files can contain personal data and must not be shared as redacted reports. Redacted action steps are audit copies and must never be replayed.
+
+Field and regex masking cannot reliably identify every person or arbitrary ID in free prose. Review metadata before external sharing. Saved session records contain only redacted placeholders for nested escalation screenshots and DOM; the original raw evidence is kept in restricted escalation files.
+
 ## Action risk classification (Phase 15)
 
 `src.safety.risk_classifier.classify_action_risk` assigns safe, caution, risky, or critical risk to each recorded replay step. Scores accumulate from action type, reviewed locator and reasoning keywords, prior failures and recovery, and sequence position. It does not inspect typed parameter values. The `RISK_*` settings in `config.example.env` configure keyword weights and sequence thresholds; malformed policy configuration stops replay. Every assessment is attached to `ReplayResult` and persisted in session metadata with a per-step risk level.

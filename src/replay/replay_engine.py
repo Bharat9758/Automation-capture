@@ -52,6 +52,7 @@ from src.replay.error_handler import (
 from src.replay.locator_strategy import ElementNotFoundError, LocatorResolver
 from src.safety.allowlist import AllowlistConfig, AllowlistViolation, enforce_allowlist, get_allowed_actions_for_url, is_url_allowed, load_allowlist
 from src.safety.risk_classifier import ActionRiskAssessment, RiskApproval, RiskLevel, classify_action_risk
+from src.safety.data_redactor import EvidencePreservation, load_redaction_policy, redact_escalation_request, save_raw_evidence
 
 
 LOGGER = get_logger(__name__)
@@ -579,6 +580,10 @@ def replay_artifact(
             raise ValidationError(f"Could not load reviewed allowlist: {type(exc).__name__}") from exc
     if not isinstance(allowlist, AllowlistConfig):
         raise ValidationError("allowlist must be an AllowlistConfig")
+    try:
+        redaction_policy = load_redaction_policy()
+    except ValueError as exc:
+        raise ValidationError("A valid redaction policy is required before replay") from exc
     session_manager = SessionLifecycleManager()
     session_directory = os.environ.get("SESSION_DIRECTORY", "evidence/sessions")
     if not session_directory:
@@ -700,7 +705,22 @@ def replay_artifact(
             previous_steps=[entry.copy() for entry in step_history if entry.get("step_number", 0) < current or not pending],
             input_params=input_params,
         )
-        save_escalation_request(request, str(os.path.join(directory, f"{request.escalation_id}.json")))
+        request = redact_escalation_request(request, redaction_policy)
+        preserved = EvidencePreservation(
+            raw_evidence={"screenshots": request.screenshot, "dom_snapshot": request.dom_snapshot},
+            redacted_metadata={"escalation_id": request.escalation_id, "input_params": request.input_params},
+        )
+        raw_dir = os.environ.get("RAW_EVIDENCE_DIRECTORY", os.path.join(directory, "raw"))
+        raw_path = save_raw_evidence(preserved.raw_evidence["screenshots"], preserved.raw_evidence["dom_snapshot"],
+                                     raw_dir, request.escalation_id)
+        try:
+            save_escalation_request(request, str(os.path.join(directory, f"{request.escalation_id}.json")))
+        except (OSError, ValueError):
+            try:
+                os.unlink(raw_path)
+            except OSError:
+                pass
+            raise
         return request
 
     def hydrate_stuck(stuck: StuckState, step_index: int) -> StuckState:

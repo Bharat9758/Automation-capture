@@ -1,5 +1,7 @@
 # AutomationCapture Project Report
 
+Phase 16 adds configurable metadata redaction at basic, strict, and paranoid levels. It applies field and pattern masks to action audits, escalation metadata, session persistence, reports, and JSON logs. Raw screenshots and DOM remain unchanged for private human handoff and are stored separately with owner-only file permissions. Saved output values are masked while in-memory replay outputs remain available to callers. `NONE` is restricted to development mode; strict redaction is the default.
+
 Phase 15 scores each recorded action using configurable keyword weights, failure and recovery history, and sequence context. It records the risk grade in the replay result and session audit. Caution continues with a structured event, risky actions warn, and critical or elevated risky actions pause before execution. Step-bound human approvals are recorded in the existing handoff and session files before replay proceeds in the original browser. Allowlist denial remains a hard barrier regardless of approval.
 
 Phase 14 adds a reviewed, fail-closed JSON page and element allowlist to replay. It checks destinations before navigation and checks interaction, recovery, checkpoint, and output targets before use. Forbidden action keywords stop replay; actions requiring confirmation pause for the existing human handoff. The example rules need review and customization before use with another application.
