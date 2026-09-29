@@ -1,5 +1,7 @@
 # AutomationCapture Project Report
 
+Phase 15 scores each recorded action using configurable keyword weights, failure and recovery history, and sequence context. It records the risk grade in the replay result and session audit. Caution continues with a structured event, risky actions warn, and critical or elevated risky actions pause before execution. Step-bound human approvals are recorded in the existing handoff and session files before replay proceeds in the original browser. Allowlist denial remains a hard barrier regardless of approval.
+
 Phase 14 adds a reviewed, fail-closed JSON page and element allowlist to replay. It checks destinations before navigation and checks interaction, recovery, checkpoint, and output targets before use. Forbidden action keywords stop replay; actions requiring confirmation pause for the existing human handoff. The example rules need review and customization before use with another application.
 
 ## 1. Summary

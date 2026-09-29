@@ -1,5 +1,11 @@
 # AutomationCapture
 
+## Action risk classification (Phase 15)
+
+`src.safety.risk_classifier.classify_action_risk` assigns safe, caution, risky, or critical risk to each recorded replay step. Scores accumulate from action type, reviewed locator and reasoning keywords, prior failures and recovery, and sequence position. It does not inspect typed parameter values. The `RISK_*` settings in `config.example.env` configure keyword weights and sequence thresholds; malformed policy configuration stops replay. Every assessment is attached to `ReplayResult` and persisted in session metadata with a per-step risk level.
+
+Replay checks the allowlist first. Caution actions log and continue; risky actions warn, and elevated risky cases pause for review. Critical actions pause before execution. A human operator can take control of the original session and call `SessionManager.approve_risk_action(session, RiskApproval(...))` while controlling it, followed by `approve_resume(session, resume_step=<paused step>)` and `give_control_to_automation(session)`. The resumed replay verifies that this explicit approval belongs to the paused step and persists it before executing the step. An operator can instead complete the step manually and approve resuming at the next step. A general resume signal without a step approval cannot execute a critical action. The allowlist still denies forbidden actions even when a risk approval exists.
+
 ## Replay allowlist (Phase 14)
 
 Set `ALLOWLIST_PATH` to a reviewed JSON file for the target application. Copy `config/allowlist.example.json` and edit its exact domains, paths, allowed actions, and element locators. Replay refuses to start if the file is missing or invalid. Every initial or recorded navigation, element action, recovery action, output read, and checkpoint locator is checked. Unapproved redirects stop replay. `ALLOWED_DOMAINS` remains a separate navigation restriction. Exact paths start with `/`; use `regex:<expression>` for a full-path regular expression. Locator fallbacks must also be reviewed.

@@ -17,6 +17,7 @@ from src.agent.actor import Actor
 from src.artifact.schema import AutomationArtifact
 from src.escalation.escalation_request import EscalationRequest
 from src.logging import get_logger
+from src.safety.risk_classifier import RiskApproval, RiskLevel
 from src.replay.locator_strategy import LocatorResolver
 
 
@@ -94,6 +95,7 @@ class HandoffSession:
     artifact_id: str = ""
     lifecycle_id: str = ""
     human_control_started_at: datetime | None = None
+    risk_approvals: list[RiskApproval] = field(default_factory=list)
 
 
 def _require_driver(session: HandoffSession) -> WebDriver:
@@ -196,6 +198,35 @@ class SessionManager:
         session.resume_step = requested
         session.automation_can_resume = True
         LOGGER.info("handoff_resume_approved", extra={"event": "handoff_resume_approved", "escalation_id": session.escalation_id, "resume_step": requested})
+        return session
+
+    def approve_risk_action(self, session: HandoffSession, approval: RiskApproval) -> HandoffSession:
+        """Bind an escalated step approval to the current human-owned handoff.
+
+        Args:
+            session: Paused original browser currently controlled by a human.
+            approval: Explicit approval of the paused step.
+
+        Returns:
+            Same session with the approval recorded.
+
+        Raises:
+            RuntimeError: Human does not control the live session.
+            ValueError: The approval does not match this pause.
+        """
+        _require_driver(session)
+        if session.in_control != "human":
+            raise RuntimeError("Only the controlling human can approve an escalated step")
+        if (not isinstance(approval, RiskApproval) or approval.step_number != session.paused_step
+                or approval.risk_level < RiskLevel.RISKY or approval.approval_method != "human_interactive"
+                or _parse_time(approval.approved_at) < session.paused_at):
+            raise ValueError("Risk approval must match the current paused step and handoff")
+        if any(item.step_number == approval.step_number for item in session.risk_approvals):
+            raise ValueError("Critical step already has an approval")
+        session.risk_approvals.append(approval)
+        LOGGER.info("handoff_risk_approved", extra={"event": "handoff_risk_approved", "step": approval.step_number,
+                                                  "escalation_id": session.escalation_id,
+                                                  "operator_id": approval.approved_by})
         return session
 
     def give_control_to_automation(self, session: HandoffSession) -> HandoffSession:
@@ -466,7 +497,9 @@ def save_handoff_session(session: HandoffSession, filepath: str) -> str:
                "artifact_id": session.artifact_id, "lifecycle_id": session.lifecycle_id,
                "human_control_started_at": session.human_control_started_at.isoformat() if session.human_control_started_at else None,
                "human_actions": [{**asdict(item), "value": "***REDACTED***" if item.action == "type" else item.value}
-                                 for item in session.human_actions]}
+                                 for item in session.human_actions],
+               "risk_approvals": [{**asdict(item), "risk_level": item.risk_level.name.lower()}
+                                  for item in session.risk_approvals]}
     target = Path(filepath)
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temp: str | None = None
@@ -510,10 +543,13 @@ def load_handoff_session(filepath: str, driver: WebDriver | None = None) -> Hand
         if driver is not None and getattr(driver, "session_id", None) != data["session_id"]:
             raise ValueError("WebDriver session ID mismatch")
         actions = [HumanAction(**action) for action in data["human_actions"]]
+        approvals = [RiskApproval(**{**item, "risk_level": RiskLevel[item["risk_level"].upper()]})
+                     for item in data.get("risk_approvals", [])]
         session = HandoffSession(session_id=data["session_id"], escalation_id=data["escalation_id"],
                                  driver=driver, in_control=data["in_control"],
                                  in_control_since=_parse_time(data["in_control_since"]),
-                                 human_actions=actions, automation_can_resume=data["automation_can_resume"],
+                                 human_actions=actions, risk_approvals=approvals,
+                                 automation_can_resume=data["automation_can_resume"],
                                  started_at=_parse_time(data["started_at"]), paused_at=_parse_time(data["paused_at"]),
                                  resume_step=data["resume_step"], paused_step=data["paused_step"],
                                  artifact_id=data["artifact_id"], lifecycle_id=data.get("lifecycle_id", ""),
@@ -526,6 +562,10 @@ def load_handoff_session(filepath: str, driver: WebDriver | None = None) -> Hand
                 or isinstance(session.paused_step, bool) or not isinstance(session.paused_step, int)
                 or session.paused_step < 0 or session.resume_step < session.paused_step):
             raise ValueError("Invalid handoff identifiers or replay step")
+        if any(approval.step_number != session.paused_step or approval.risk_level < RiskLevel.RISKY
+               or approval.approval_method != "human_interactive" or
+               _parse_time(approval.approved_at) < session.paused_at for approval in session.risk_approvals):
+            raise ValueError("Invalid risk approval for handoff")
         return session
     except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as exc:
         raise ValueError(f"Invalid handoff JSON: {type(exc).__name__}") from exc

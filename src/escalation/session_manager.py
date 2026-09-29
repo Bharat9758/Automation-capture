@@ -16,6 +16,7 @@ from selenium.webdriver.remote.webdriver import WebDriver
 
 from src.escalation.escalation_request import EscalationRequest, escalation_to_json, json_to_escalation
 from src.logging import get_logger
+from src.safety.risk_classifier import ActionRiskAssessment, RiskApproval, RiskLevel
 
 
 LOGGER = get_logger(__name__)
@@ -99,6 +100,8 @@ class SessionMetadata:
     outcome: str | None = None
     outputs: dict[str, Any] = field(default_factory=dict)
     input_names: list[str] = field(default_factory=list)
+    risk_assessments: list[dict[str, Any]] = field(default_factory=list)
+    risk_approvals: list[dict[str, Any]] = field(default_factory=list)
 
 
 class SessionLifecycleManager:
@@ -285,8 +288,55 @@ class SessionLifecycleManager:
         session.completed_at, session.outcome = _now(), "abandoned"
         return session
 
+    def record_risk_assessment(self, session: SessionMetadata, step_num: int,
+                               assessment: ActionRiskAssessment) -> SessionMetadata:
+        """Record an assessed step before it can run or pause.
+
+        Args:
+            session: Active lifecycle.
+            step_num: One-based artifact step.
+            assessment: Value-free risk decision.
+
+        Returns:
+            Session with a durable audit entry.
+        """
+        if session.lifecycle_state not in {SessionLifecycle.RUNNING, SessionLifecycle.RESUMED}:
+            raise RuntimeError("Risk assessment requires running automation")
+        if isinstance(step_num, bool) or not isinstance(step_num, int) or step_num < 1 or not isinstance(assessment, ActionRiskAssessment):
+            raise ValueError("Invalid risk assessment")
+        session.risk_assessments.append({"step_number": step_num, "risk_level": assessment.risk_level.name.lower(),
+                                         "evidence": list(assessment.evidence), "requires_approval": assessment.requires_approval,
+                                         "escalation_threshold": assessment.escalation_threshold, "timestamp": _now()})
+        LOGGER.info("session_risk", extra={"event": "session_risk", "session_id": session.session_id,
+                                           "step": step_num, "risk_level": assessment.risk_level.name.lower()})
+        return session
+
+    def record_risk_approval(self, session: SessionMetadata, approval: RiskApproval) -> SessionMetadata:
+        """Audit explicit operator permission for a paused action.
+
+        Args:
+            session: Original live replay lifecycle.
+            approval: Step-bound human decision.
+
+        Returns:
+            Session with approval metadata, without browser values.
+        """
+        if session.lifecycle_state not in {SessionLifecycle.RUNNING, SessionLifecycle.RESUMED}:
+            raise RuntimeError("Approval audit requires running automation")
+        if not isinstance(approval, RiskApproval) or approval.approval_method != "human_interactive":
+            raise ValueError("A human risk approval is required")
+        entry = {"step_number": approval.step_number, "risk_level": approval.risk_level.name.lower(),
+                 "approved_by": approval.approved_by, "approved_at": approval.approved_at,
+                 "approval_method": approval.approval_method}
+        if entry not in session.risk_approvals:
+            session.risk_approvals.append(entry)
+        LOGGER.info("session_risk_approval", extra={"event": "session_risk_approval", "session_id": session.session_id,
+                                                    "step": approval.step_number, "operator_id": approval.approved_by})
+        return session
+
     def track_step_execution(self, session: SessionMetadata, step_num: int,
-                             success: bool, duration_ms: int) -> SessionMetadata:
+                             success: bool, duration_ms: int,
+                             risk_level: RiskLevel | None = None) -> SessionMetadata:
         """Record step outcome and timing without values or DOM.
 
         Args:
@@ -294,6 +344,7 @@ class SessionLifecycleManager:
             step_num: One-based artifact step.
             success: Whether the action and outcome completed.
             duration_ms: Total action and expected-outcome time.
+            risk_level: Classified risk for this action, if available.
 
         Returns:
             Updated session.
@@ -304,8 +355,11 @@ class SessionLifecycleManager:
                 or type(success) is not bool or isinstance(duration_ms, bool)
                 or not isinstance(duration_ms, int) or duration_ms < 0):
             raise ValueError("Invalid step number, success, or duration_ms")
+        if risk_level is not None and not isinstance(risk_level, RiskLevel):
+            raise ValueError("risk_level must be a RiskLevel")
         session.step_executions.append({"step_number": step_num, "success": success,
-                                        "duration_ms": duration_ms, "timestamp": _now()})
+                                        "duration_ms": duration_ms, "timestamp": _now(),
+                                        "risk_level": risk_level.name.lower() if risk_level is not None else None})
         LOGGER.info("session_step", extra={"event": "session_step", "session_id": session.session_id,
                                            "step": step_num, "success": success, "duration_ms": duration_ms})
         return session
@@ -405,6 +459,8 @@ class SessionLifecycleManager:
                 "automation_duration": metrics["automation_duration_seconds"],
                 "human_duration": metrics["human_duration_seconds"],
                 "escalations": [item.escalation_id for item in session.escalations],
+                "risk_assessments": [item.copy() for item in session.risk_assessments],
+                "risk_approvals": [item.copy() for item in session.risk_approvals],
                 "steps": [entry.copy() for entry in session.step_executions],
                 "final_status": session.lifecycle_state.value, "outputs": dict(session.outputs)}
 
@@ -477,7 +533,12 @@ def load_session_metadata(filepath: str, driver: WebDriver | None = None) -> Ses
     """
     try:
         data = json.loads(Path(filepath).read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or set(data) != set(SessionMetadata.__dataclass_fields__) - {"driver_instance"}:
+        if not isinstance(data, dict):
+            raise ValueError("Session metadata must be an object")
+        # Older session files predate Phase 15; retain their audit history.
+        data.setdefault("risk_assessments", [])
+        data.setdefault("risk_approvals", [])
+        if set(data) != set(SessionMetadata.__dataclass_fields__) - {"driver_instance"}:
             raise ValueError("Session metadata fields are incomplete")
         data["lifecycle_state"] = SessionLifecycle(data["lifecycle_state"])
         data["escalations"] = [json_to_escalation(json.dumps(item)) for item in data["escalations"]]
@@ -492,6 +553,13 @@ def load_session_metadata(filepath: str, driver: WebDriver | None = None) -> Ses
         if driver is not None and getattr(driver, "session_id", None) != session.webdriver_session_id:
             raise ValueError("Original WebDriver session ID mismatch")
         if (not isinstance(session.step_executions, list) or not isinstance(session.outputs, dict)
+                or not isinstance(session.risk_assessments, list)
+                or not isinstance(session.risk_approvals, list)
+                or any(not isinstance(item, dict) or item.get("risk_level") not in
+                       {level.name.lower() for level in RiskLevel} for item in session.risk_assessments)
+                or any(not isinstance(item, dict) or item.get("risk_level") not in
+                       {level.name.lower() for level in RiskLevel} or not item.get("approved_by")
+                       for item in session.risk_approvals)
                 or isinstance(session.human_actions_total, bool) or not isinstance(session.human_actions_total, int)
                 or session.human_actions_total < 0):
             raise ValueError("Invalid session audit fields")

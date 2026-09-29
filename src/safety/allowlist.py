@@ -266,7 +266,7 @@ def _matched_element(locator: Locator, page: AllowlistedPage) -> AllowlistedElem
 
 
 def is_element_allowed(locator: Locator, current_url: str, action: str,
-                       config: AllowlistConfig) -> tuple[bool, str | None]:
+                       config: AllowlistConfig, *, confirmed: bool = False) -> tuple[bool, str | None]:
     """Validate a page action and the complete locator fallback tree.
 
     Args:
@@ -274,6 +274,7 @@ def is_element_allowed(locator: Locator, current_url: str, action: str,
         current_url: Browser URL.
         action: Requested interaction.
         config: Reviewed rules.
+        confirmed: Whether an operator approved this exact step in the live handoff.
 
     Returns:
         Authorization flag and a safe denial reason.
@@ -291,12 +292,12 @@ def is_element_allowed(locator: Locator, current_url: str, action: str,
         return False, "Action is not approved for this element"
     if action == "click" and not element.safe_to_click or action == "type" and not element.safe_to_type:
         return False, "Element is marked unsafe for this action"
-    if element.risky_keyword or element.requires_confirmation:
+    if (element.risky_keyword or element.requires_confirmation) and not confirmed:
         return False, "Element requires human confirmation"
     safe, reason = check_for_forbidden_keywords(element.element_id, action, element.description, config)
     if not safe:
         return False, reason
-    if _contains_keyword(element.element_id + " " + element.description, config.require_confirmation_for):
+    if _contains_keyword(element.element_id + " " + element.description, config.require_confirmation_for) and not confirmed:
         return False, "Element requires human confirmation"
     return True, None
 
@@ -362,7 +363,7 @@ def get_allowed_actions_for_url(url: str, config: AllowlistConfig) -> list[str]:
 
 
 def enforce_allowlist(driver: WebDriver, step: ActionStep, artifact: AutomationArtifact,
-                      allowlist: AllowlistConfig) -> tuple[bool, str | None]:
+                      allowlist: AllowlistConfig, *, confirmed: bool = False) -> tuple[bool, str | None]:
     """Authorize an action before any browser mutation; raise on denial.
 
     Args:
@@ -370,6 +371,7 @@ def enforce_allowlist(driver: WebDriver, step: ActionStep, artifact: AutomationA
         step: Substituted or recorded action.
         artifact: Artifact being executed.
         allowlist: Reviewed page and element rules.
+        confirmed: Verified human approval of this step; never bypasses forbidden rules.
 
     Returns:
         ``(True, None)`` for an approved action.
@@ -410,14 +412,14 @@ def enforce_allowlist(driver: WebDriver, step: ActionStep, artifact: AutomationA
     safe, reason = check_for_forbidden_keywords("", step.action, step.reasoning, allowlist)
     if not safe:
         deny(reason or "Forbidden action")
-    if requires_confirmation(step.reasoning, allowlist):
+    if requires_confirmation(step.reasoning, allowlist) and not confirmed:
         deny("Action requires human confirmation")
     if step.locator is not None:
         if page is None:
             deny("Element has no approved page rule")
         element = _matched_element(step.locator, page)
         element_id = element.element_id if element else ""
-        approved, reason = is_element_allowed(step.locator, url, step.action, allowlist)
+        approved, reason = is_element_allowed(step.locator, url, step.action, allowlist, confirmed=confirmed)
         if not approved:
             deny(reason or "Element is not approved")
     elif step.action in {"click", "type", "read_text", "wait"}:

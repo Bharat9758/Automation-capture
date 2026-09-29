@@ -309,12 +309,13 @@ def detect_stuck_state(
         reason, action = "Human requested intervention", "Awaiting human input"
     elif classification.get("classification") == "hard_failure":
         reason, action = "Hard failure during replay", "Check if page structure changed"
-    elif 0 <= next_index < len(artifact.steps) and is_risky_action(artifact.steps[next_index], artifact):
-        reason, action, stopped_at = "Risky action requires human approval", "Review action before proceeding", artifact.steps[next_index].step_number
     elif isinstance(current_state.get("matching_element_count"), int) and current_state["matching_element_count"] > 1:
         reason, action = "Ambiguous state - multiple matches", "Human must select correct element"
         if 0 <= next_index < len(artifact.steps):
             stopped_at = artifact.steps[next_index].step_number
+    elif (0 <= next_index < len(artifact.steps) and is_risky_action(artifact.steps[next_index], artifact)
+          and current_state.get("approved_risky_step") != artifact.steps[next_index].step_number):
+        reason, action, stopped_at = "Risky action requires human approval", "Review action before proceeding", artifact.steps[next_index].step_number
     elif not current_state.get("skip_no_progress") and is_state_repeated(signature, prior_signatures + [signature], threshold):
         reason, action = "Same state repeated - no progress", "Review page for missing action"
 

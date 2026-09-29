@@ -22,6 +22,7 @@ from src.escalation.session_manager import (
     save_session_metadata,
 )
 from src.escalation.stuck_detector import StuckState
+from src.safety.risk_classifier import ActionRiskAssessment, RiskLevel
 
 
 @pytest.fixture
@@ -68,6 +69,9 @@ def test_create_start_pause_human_resume_complete(manager: SessionLifecycleManag
     assert session.lifecycle_state == SessionLifecycle.CREATED and session.input_names == ["member_id"]
     assert "private" not in str(vars(session))
     manager.start_session(session)
+    manager.record_risk_assessment(session, 1, ActionRiskAssessment(
+        risk_level=RiskLevel.CAUTION, reasoning="Data entry", evidence=["data entry action"],
+        recommended_action="Log carefully", requires_approval=False, escalation_threshold=False))
     manager.track_step_execution(session, 1, True, 125)
     escalation = _escalation()
     manager.pause_session(session, escalation)  # type: ignore[arg-type]
@@ -85,6 +89,7 @@ def test_create_start_pause_human_resume_complete(manager: SessionLifecycleManag
     assert manager.is_artifact_improvement_candidate(session)
     assert manager.get_session_summary(session)["outcome"] == "success"
     assert manager.get_full_session_report(session)["outputs"] == {"balance": 100}
+    assert manager.get_full_session_report(session)["risk_assessments"][0]["risk_level"] == "caution"
     assert manager.get_session_escalation_summary(session)["successful_recovery"] is True
     assert manager.get_escalations_for_session(session) == [escalation]
 

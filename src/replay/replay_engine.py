@@ -51,6 +51,7 @@ from src.replay.error_handler import (
 )
 from src.replay.locator_strategy import ElementNotFoundError, LocatorResolver
 from src.safety.allowlist import AllowlistConfig, AllowlistViolation, enforce_allowlist, get_allowed_actions_for_url, is_url_allowed, load_allowlist
+from src.safety.risk_classifier import ActionRiskAssessment, RiskApproval, RiskLevel, classify_action_risk
 
 
 LOGGER = get_logger(__name__)
@@ -81,6 +82,7 @@ class ReplayResult:
     handoff_session: HandoffSession | None = None
     updated_artifact: AutomationArtifact | None = None
     session: SessionMetadata | None = None
+    risk_assessments: list[ActionRiskAssessment] = field(default_factory=list)
 
 
 def _current_replay_state(driver: WebDriver) -> dict[str, Any]:
@@ -553,6 +555,8 @@ def replay_artifact(
                 or handoff_session.artifact_id != artifact.id
                 or getattr(driver, "session_id", None) != handoff_session.session_id
                 or handoff_session.resume_step > len(artifact.steps) + 1
+                or not isinstance(handoff_session.risk_approvals, list)
+                or any(not isinstance(approval, RiskApproval) for approval in handoff_session.risk_approvals)
                 or request_human_help):
             raise ValidationError("A matching, human-approved live handoff is required to resume")
     directory = escalation_directory if escalation_directory is not None else os.environ.get("ESCALATION_DIRECTORY", "evidence/escalations")
@@ -605,6 +609,8 @@ def replay_artifact(
         session_manager.resume_session(lifecycle_session, human_actions=len(handoff_session.human_actions))
     assert lifecycle_session is not None
     lifecycle = lifecycle_session
+    assessments: list[ActionRiskAssessment] = []
+    risk_errors: list[dict[str, Any]] = [entry for entry in lifecycle.step_executions if entry.get("success") is False]
 
     def persist_lifecycle(result: ReplayResult) -> ReplayResult:
         """Persist a final or paused result and expose its lifecycle record.
@@ -616,6 +622,7 @@ def replay_artifact(
             Original result, or a hard failure if the audit cannot be saved.
         """
         result.session = lifecycle
+        result.risk_assessments = list(assessments)
         try:
             save_session_metadata(lifecycle, os.path.join(session_directory, f"{lifecycle.session_id}.json"))
         except (OSError, TypeError, ValueError) as exc:
@@ -731,7 +738,7 @@ def replay_artifact(
                     "current_url": hydrated.escalation_context.get("current_url"),
                     "escalation_context": hydrated.escalation_context}
         try:
-            request = build_escalation(hydrated, pending=hydrated.reason in {
+            request = build_escalation(hydrated, pending=hydrated.reason.startswith("Critical risk:") or hydrated.reason in {
                 "Risky action requires human approval", "Ambiguous state - multiple matches", "Human requested intervention"
             })
             handoff = create_handoff(request)
@@ -873,14 +880,50 @@ def replay_artifact(
             continue
         if step.action == "navigate" and step.value:
             step = replace(step, value=urljoin(artifact.target_url, step.value))
+        recorded = artifact.steps[step.step_number - 1]
+        previous = [artifact.steps[entry["step_number"] - 1] for entry in lifecycle.step_executions
+                    if entry.get("success") is True and 1 <= entry.get("step_number", 0) <= len(artifact.steps)
+                    and entry["step_number"] < step.step_number]
         try:
-            enforce_allowlist(driver, step, artifact, allowlist)
+            assessment = classify_action_risk(recorded, artifact, step.step_number, previous, risk_errors)
+        except (TypeError, ValueError) as exc:
+            return failure(step.step_number, f"Risk classification failed: {type(exc).__name__}")
+        assessments.append(assessment)
+        session_manager.record_risk_assessment(lifecycle, step.step_number, assessment)
+        if assessment.risk_level >= RiskLevel.RISKY:
+            LOGGER.warning("replay_risk_warning", extra={"event": "replay_risk_warning", "artifact_id": artifact.id,
+                                                 "step": step.step_number, "risk_level": assessment.risk_level.name.lower()})
+        elif assessment.risk_level == RiskLevel.CAUTION:
+            LOGGER.info("replay_risk_caution", extra={"event": "replay_risk_caution", "artifact_id": artifact.id,
+                                              "step": step.step_number})
+        approval = next((item for item in handoff_session.risk_approvals
+                         if item.step_number == step.step_number and item.risk_level >= assessment.risk_level
+                         and item.approval_method == "human_interactive"
+                         and datetime.fromisoformat(item.approved_at.replace("Z", "+00:00")) >= handoff_session.paused_at), None) \
+                        if handoff_session is not None and handoff_session.paused_step == step.step_number else None
+        approved = approval is not None
+        try:
+            enforce_allowlist(driver, step, artifact, allowlist, confirmed=approved)
         except AllowlistViolation as exc:
             if "requires human confirmation" in exc.reason:
                 return pause(StuckState(is_stuck=True, reason="Risky action requires human approval",
                                         current_step=step.step_number, recommended_action="Review action before proceeding"),
                              step.step_number - 2)
             return failure(step.step_number, f"Allowlist violation: {exc.reason}")
+        if assessment.escalation_threshold and not approved:
+            reason = (f"Critical risk: {assessment.reasoning}" if assessment.risk_level == RiskLevel.CRITICAL
+                      else "Risky action requires human approval")
+            return pause(StuckState(is_stuck=True, reason=reason,
+                                    current_step=step.step_number,
+                                    recommended_action=assessment.recommended_action), step.step_number - 2)
+        if approved and handoff_session is not None and approval is not None:
+            try:
+                handoff_dir = os.environ.get("HANDOFF_DIRECTORY", "evidence/handoffs")
+                save_handoff_session(handoff_session, os.path.join(handoff_dir, f"{handoff_session.escalation_id}.json"))
+                session_manager.record_risk_approval(lifecycle, approval)
+                save_session_metadata(lifecycle, os.path.join(session_directory, f"{lifecycle.session_id}.json"))
+            except (OSError, ValueError, TypeError) as exc:
+                return failure(step.step_number, f"Risk approval persistence failed: {type(exc).__name__}")
         outcome = step.value if step.action == "checkpoint" else step.expected_outcome
         condition, delimiter, argument = (outcome or "").partition(":")
         if delimiter and condition in {"element_visible", "element_count", "text_changed"}:
@@ -899,6 +942,8 @@ def replay_artifact(
             state = _current_replay_state(driver)
             state["matching_element_count"] = count_matching_elements(driver, step.locator, resolver)
             state["skip_no_progress"] = True
+            if approved:
+                state["approved_risky_step"] = step.step_number
             decision = detect_stuck_state(artifact, step.step_number - 2, state, {}, tracker.get_history())
             if decision.is_stuck:
                 return pause(decision, step.step_number - 2)
@@ -916,9 +961,10 @@ def replay_artifact(
             except (ElementNotFoundError, WebDriverException, ValueError) as exc:
                 classification = detect_and_classify_error(driver, artifact, step.step_number, exc)
                 if classification.classification == "expected_business_outcome":
-                    session_manager.track_step_execution(lifecycle, step.step_number, False, round((time.monotonic() - step_started) * 1000))
+                    session_manager.track_step_execution(lifecycle, step.step_number, False, round((time.monotonic() - step_started) * 1000), assessment.risk_level)
                     return business_outcome(step.step_number, classification)
                 if maybe_recover(step.step_number, classification, resolver, attempt, step.action in _IMPLICIT_RETRY_ACTIONS and phase == "action"):
+                    risk_errors.append({"step_number": step.step_number, "success": False, "recovered": True})
                     continue
                 default = (
                     f"{step.action} failed: {type(exc).__name__}" if phase == "action"
@@ -926,12 +972,12 @@ def replay_artifact(
                     else f"Outcome check failed: {type(exc).__name__}"
                 )
                 message = classification.error_message if classification.classification == "hard_failure" and classification.error_message and artifact.known_errors else default
-                session_manager.track_step_execution(lifecycle, step.step_number, False, round((time.monotonic() - step_started) * 1000))
+                session_manager.track_step_execution(lifecycle, step.step_number, False, round((time.monotonic() - step_started) * 1000), assessment.risk_level)
                 return failure(step.step_number, message)
             logs.append(f"Step {step.step_number}: {step.action} succeeded in {action_result['duration_ms']} ms")
             break
         record_step_in_history(step_history, {"step_number": step.step_number, "action": step.action, "success": True})
-        session_manager.track_step_execution(lifecycle, step.step_number, True, round((time.monotonic() - step_started) * 1000))
+        session_manager.track_step_execution(lifecycle, step.step_number, True, round((time.monotonic() - step_started) * 1000), assessment.risk_level)
         if step.action in {"navigate", "click", "wait", "checkpoint"}:
             state = _current_replay_state(driver)
             decision = detect_stuck_state(artifact, step.step_number - 1, state, {}, tracker.get_history())

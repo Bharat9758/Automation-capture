@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, call, patch
@@ -23,7 +23,7 @@ from selenium.webdriver.remote.webelement import WebElement
 
 from src.artifact.schema import ActionStep, AutomationArtifact, Locator, OutputField
 from src.escalation.escalation_request import load_escalation_request
-from src.escalation.human_handoff import HumanAction, SessionManager, record_human_actions
+from src.escalation.human_handoff import HumanAction, SessionManager, record_human_actions, save_handoff_session, load_handoff_session
 from src.escalation.session_manager import SessionLifecycle, load_session_metadata
 from src.replay.checkpoint import CheckpointVerificationError
 from src.replay.replay_engine import (
@@ -36,6 +36,7 @@ from src.replay.replay_engine import (
     wait_for_outcome,
 )
 from src.safety.allowlist import load_allowlist
+from src.safety.risk_classifier import RiskApproval, RiskLevel
 
 
 @pytest.fixture
@@ -145,6 +146,9 @@ def test_replay_end_to_end_without_llm(driver: Mock, artifact: AutomationArtifac
     assert "12345" not in str(artifact.to_dict())
     assert result.session is not None and result.session.lifecycle_state == SessionLifecycle.COMPLETED
     assert len(result.session.step_executions) == len(artifact.steps)
+    assert len(result.risk_assessments) == len(artifact.steps)
+    assert len(result.session.risk_assessments) == len(artifact.steps)
+    assert result.session.step_executions[1]["risk_level"] == "risky"
     saved_session = tmp_path / "evidence" / "sessions" / f"{result.session.session_id}.json"
     assert load_session_metadata(str(saved_session)).lifecycle_state == SessionLifecycle.COMPLETED
 
@@ -189,6 +193,81 @@ def test_reviewed_confirmation_pauses_before_click(driver: Mock, artifact: Autom
     result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"}, allowlist=config)
     assert result.status == "escalated" and result.step_failed == 3
     assert result.handoff_session is not None and result.handoff_session.paused_step == 3
+    manager = SessionManager()
+    manager.give_control_to_human(result.handoff_session)
+    manager.approve_risk_action(result.handoff_session, RiskApproval(
+        step_number=3, risk_level=RiskLevel.RISKY, approved_by="operator",
+        approved_at=datetime.now(timezone.utc).isoformat(), approval_method="human_interactive"))
+    manager.approve_resume(result.handoff_session, resume_step=3)
+    manager.give_control_to_automation(result.handoff_session)
+    resumed = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"},
+                              allowlist=config, handoff_session=result.handoff_session)
+    assert resumed.success
+    assert resumed.session is not None and resumed.session.risk_approvals[0]["approved_by"] == "operator"
+
+
+def test_critical_risk_requires_step_bound_human_approval(
+    driver: Mock, artifact: AutomationArtifact, tmp_path: Path,
+) -> None:
+    """Human approval in the original browser authorizes exactly the paused step."""
+    payload = artifact.to_dict()
+    payload["steps"][2]["reasoning"] = "Confirm and close account permanently"
+    critical = AutomationArtifact.from_dict(payload)
+    first = replay_artifact(driver, critical, {"member_id": "12345"})
+    assert first.status == "escalated" and first.step_failed == 3
+    assert first.risk_assessments[-1].risk_level == RiskLevel.CRITICAL
+    assert first.session is not None and first.session.risk_assessments[-1]["risk_level"] == "critical"
+    assert first.handoff_session is not None and first.handoff_session.paused_step == 3
+    assert first.escalation_request is not None and first.escalation_request.last_action["pending"] is True
+    assert not any(entry.args == (By.ID, "search") for entry in driver.find_element.call_args_list)
+
+    manager = SessionManager()
+    session = first.handoff_session
+    manager.give_control_to_human(session)
+    with pytest.raises(ValueError, match="paused step"):
+        manager.approve_risk_action(session, RiskApproval(step_number=4, risk_level=RiskLevel.CRITICAL,
+                                                         approved_by="operator", approved_at=datetime.now(timezone.utc).isoformat(),
+                                                         approval_method="human_interactive"))
+    with pytest.raises(ValueError, match="paused step"):
+        manager.approve_risk_action(session, RiskApproval(step_number=3, risk_level=RiskLevel.CRITICAL,
+                                                         approved_by="operator", approved_at="2020-01-01T00:00:00Z",
+                                                         approval_method="human_interactive"))
+    with pytest.raises(ValueError, match="paused step"):
+        manager.approve_risk_action(session, RiskApproval(step_number=3, risk_level=RiskLevel.CRITICAL,
+                                                         approved_by="operator", approved_at=datetime.now(timezone.utc).isoformat(),
+                                                         approval_method="auto_approved"))
+    manager.approve_risk_action(session, RiskApproval(step_number=3, risk_level=RiskLevel.CRITICAL,
+                                                     approved_by="operator", approved_at=datetime.now(timezone.utc).isoformat(),
+                                                     approval_method="human_interactive"))
+    handoff_path = tmp_path / "handoff.json"
+    save_handoff_session(session, str(handoff_path))
+    assert load_handoff_session(str(handoff_path), driver).risk_approvals == session.risk_approvals
+    manager.approve_resume(session, resume_step=3)
+    manager.give_control_to_automation(session)
+    resumed = replay_artifact(driver, critical, {"member_id": "12345"}, handoff_session=session)
+    assert resumed.success and resumed.status == "success"
+    assert resumed.session is not None and resumed.session.lifecycle_state == SessionLifecycle.COMPLETED
+    assert any(entry["risk_level"] == "critical" for entry in resumed.session.step_executions)
+    assert len(resumed.session.risk_assessments) >= len(critical.steps) + 1
+    assert resumed.session.risk_approvals[0]["approved_by"] == "operator"
+    saved = tmp_path / "evidence" / "sessions" / f"{resumed.session.session_id}.json"
+    assert load_session_metadata(str(saved)).risk_approvals == resumed.session.risk_approvals
+
+
+def test_resume_signal_without_risk_approval_re_escalates(driver: Mock, artifact: AutomationArtifact) -> None:
+    """A general resume signal cannot silently authorize a critical action."""
+    payload = artifact.to_dict()
+    payload["steps"][2]["reasoning"] = "Confirm and close account permanently"
+    critical = AutomationArtifact.from_dict(payload)
+    first = replay_artifact(driver, critical, {"member_id": "12345"})
+    assert first.handoff_session is not None
+    manager = SessionManager()
+    manager.give_control_to_human(first.handoff_session)
+    manager.approve_resume(first.handoff_session, resume_step=3)
+    manager.give_control_to_automation(first.handoff_session)
+    again = replay_artifact(driver, critical, {"member_id": "12345"}, handoff_session=first.handoff_session)
+    assert again.status == "escalated" and again.step_failed == 3
+    assert not any(entry.args == (By.ID, "search") for entry in driver.find_element.call_args_list)
 
 
 def test_risky_click_pauses_before_execution(driver: Mock, artifact: AutomationArtifact, tmp_path: Path) -> None:
