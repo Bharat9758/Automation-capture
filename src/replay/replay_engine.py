@@ -7,7 +7,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
@@ -41,6 +41,9 @@ from src.escalation.stuck_detector import (
     record_step_in_history,
 )
 from src.logging import get_logger
+from src.logging.structured_logger import (
+    EventType, StructuredLogger, load_logs_from_file, save_logs_to_file,
+)
 from src.replay.checkpoint import CheckpointVerificationError, CheckpointVerifier
 from src.replay.error_handler import (
     ErrorClassification,
@@ -84,6 +87,7 @@ class ReplayResult:
     updated_artifact: AutomationArtifact | None = None
     session: SessionMetadata | None = None
     risk_assessments: list[ActionRiskAssessment] = field(default_factory=list)
+    audit_log_path: str | None = None
 
 
 def _current_replay_state(driver: WebDriver) -> dict[str, Any]:
@@ -614,6 +618,26 @@ def replay_artifact(
         session_manager.resume_session(lifecycle_session, human_actions=len(handoff_session.human_actions))
     assert lifecycle_session is not None
     lifecycle = lifecycle_session
+    audit_directory = os.environ.get("LOG_DIRECTORY", "evidence/logs")
+    if not audit_directory:
+        raise ValidationError("LOG_DIRECTORY must be a nonempty path")
+    try:
+        audit = StructuredLogger(lifecycle.session_id, artifact.id,
+                                 os.environ.get("STRUCTURED_LOG_LEVEL", "INFO"), redaction_policy,
+                                 private_values=list(input_params.values()))
+        audit_path = os.path.join(audit_directory, f"{lifecycle.session_id}.json")
+        if handoff_session is not None:
+            audit.restore_events(load_logs_from_file(audit_path))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ValidationError(f"Audit logger initialization failed: {type(exc).__name__}") from exc
+    if handoff_session is None:
+        audit.log_session_state(EventType.SESSION_CREATED, SessionLifecycle.CREATED)
+        audit.log_session_state(EventType.SESSION_STARTED, SessionLifecycle.RUNNING)
+    else:
+        audit.log_session_state(EventType.SESSION_RESUMED, SessionLifecycle.RESUMED)
+        for prior_approval in handoff_session.risk_approvals:
+            audit.log_approval(handoff_session.escalation_id, prior_approval.step_number, True,
+                               prior_approval.approved_by, "Human approved the paused step")
     assessments: list[ActionRiskAssessment] = []
     risk_errors: list[dict[str, Any]] = [entry for entry in lifecycle.step_executions if entry.get("success") is False]
 
@@ -630,6 +654,7 @@ def replay_artifact(
         result.risk_assessments = list(assessments)
         try:
             save_session_metadata(lifecycle, os.path.join(session_directory, f"{lifecycle.session_id}.json"))
+            result.audit_log_path = save_logs_to_file(audit, audit_path)
         except (OSError, TypeError, ValueError) as exc:
             LOGGER.error("session_save_failed", extra={"event": "session_save_failed", "artifact_id": artifact.id,
                                                   "error_type": type(exc).__name__})
@@ -763,11 +788,17 @@ def replay_artifact(
             })
             handoff = create_handoff(request)
             session_manager.pause_session(lifecycle, request)
+            audit.log_escalation(hydrated.reason, hydrated.current_step, request.escalation_id,
+                                 assessments[-1].risk_level.name if assessments else "UNKNOWN")
+            audit.log_session_state(EventType.SESSION_PAUSED, SessionLifecycle.PAUSED,
+                                    time.monotonic() - started)
         except (OSError, ValueError, TypeError) as exc:
             LOGGER.error("escalation_save_failed", extra={"event": "escalation_save_failed", "artifact_id": artifact.id,
                                                    "error_type": type(exc).__name__})
             evidence["escalation_error"] = type(exc).__name__
             session_manager.fail_session(lifecycle, f"Escalation persistence failed: {type(exc).__name__}")
+            audit.log_session_state(EventType.SESSION_FAILED, SessionLifecycle.FAILED,
+                                    time.monotonic() - started)
             return persist_lifecycle(ReplayResult(success=False, status="hard_failure", error=f"Escalation persistence failed: {type(exc).__name__}",
                                                  step_failed=hydrated.current_step, logs=logs, evidence=evidence,
                                                  duration_seconds=time.monotonic() - started, stuck_state=hydrated))
@@ -788,6 +819,8 @@ def replay_artifact(
             Failed replay result with best-effort browser evidence.
         """
         logs.append(f"Step {step_number}: {message}")
+        audit.log_event(EventType.HARD_FAILURE, "Replay failed", level="CRITICAL", step_number=step_number,
+                        data={"failure_step": step_number})
         LOGGER.error("replay_failed", extra={"event": "replay_failed", "artifact_id": artifact.id, "step": step_number, "error": message})
         evidence = capture_failure_evidence(driver, step_number)
         if checkpoint_evidence is not None:
@@ -803,11 +836,15 @@ def replay_artifact(
             request = build_escalation(hydrated, pending=True)
             handoff = create_handoff(request)
             session_manager.add_escalation_to_session(lifecycle, request)
+            audit.log_escalation(hydrated.reason, hydrated.current_step, request.escalation_id,
+                                 assessments[-1].risk_level.name if assessments else "UNKNOWN")
         except (OSError, ValueError, TypeError) as exc:
             LOGGER.error("escalation_save_failed", extra={"event": "escalation_save_failed", "artifact_id": artifact.id,
                                                    "error_type": type(exc).__name__})
             evidence["escalation_error"] = type(exc).__name__
         session_manager.fail_session(lifecycle, message)
+        audit.log_session_state(EventType.SESSION_FAILED, SessionLifecycle.FAILED,
+                                time.monotonic() - started)
         return persist_lifecycle(ReplayResult(success=False, status="hard_failure", error=message, step_failed=step_number,
                             logs=logs, evidence=evidence,
                             duration_seconds=time.monotonic() - started, stuck_state=hydrated,
@@ -826,6 +863,10 @@ def replay_artifact(
         logs.append(f"Step {step_number}: business outcome {classification.business_outcome}")
         LOGGER.info("replay_business_outcome", extra={"event": "replay_business_outcome", "artifact_id": artifact.id, "step": step_number, "business_outcome": classification.business_outcome})
         session_manager.complete_session(lifecycle, outcome=classification.business_outcome or "business_outcome")
+        audit.log_business_outcome(classification.business_outcome or "business_outcome", {},
+                                   time.monotonic() - started)
+        audit.log_session_state(EventType.SESSION_COMPLETED, SessionLifecycle.COMPLETED,
+                                time.monotonic() - started)
         return persist_lifecycle(ReplayResult(success=False, status="business_outcome", business_outcome=classification.business_outcome,
                                              logs=logs, duration_seconds=time.monotonic() - started))
 
@@ -869,6 +910,9 @@ def replay_artifact(
         elif not implicit_safe:
             return False
         logs.append(f"Step {step_number}: recovery completed; retry {attempt + 1}/{recovery_limit}")
+        audit.log_event(EventType.ERROR_RECOVERED, "Recovery attempted; retrying step",
+                        level="WARNING", step_number=step_number,
+                        data={"retry": attempt + 1, "classification": classification.classification})
         LOGGER.info("replay_retry", extra={"event": "replay_retry", "artifact_id": artifact.id, "step": step_number, "retry": attempt + 1})
         return True
 
@@ -887,8 +931,11 @@ def replay_artifact(
             if not is_url_allowed(driver.current_url, allowlist):
                 raise AllowlistViolation("Initial navigation redirected outside allowlist", action="navigate", current_url=driver.current_url)
             logs.append("Navigation to artifact target completed")
+            audit.log_step_executed(0, "navigate", None, round((time.monotonic() - started) * 1000),
+                                    "SAFE", True)
             LOGGER.info("replay_navigated", extra={"event": "replay_navigated", "artifact_id": artifact.id})
         except (WebDriverException, ValueError, AllowlistViolation) as exc:
+            audit.log_error(0, type(exc).__name__, "Initial navigation failed", "hard_failure", False)
             return failure(0, f"Initial navigation failed: {type(exc).__name__}")
     else:
         logs.append(f"Resumed from step {handoff_session.resume_step} on the original browser session")
@@ -911,6 +958,10 @@ def replay_artifact(
         assessments.append(assessment)
         session_manager.record_risk_assessment(lifecycle, step.step_number, assessment)
         if assessment.risk_level >= RiskLevel.RISKY:
+            audit.log_event(EventType.RISK_CRITICAL if assessment.risk_level == RiskLevel.CRITICAL
+                            else EventType.RISK_ELEVATED, "Action risk elevated",
+                            level="WARNING", step_number=step.step_number,
+                            data={"risk_level": assessment.risk_level.name})
             LOGGER.warning("replay_risk_warning", extra={"event": "replay_risk_warning", "artifact_id": artifact.id,
                                                  "step": step.step_number, "risk_level": assessment.risk_level.name.lower()})
         elif assessment.risk_level == RiskLevel.CAUTION:
@@ -925,12 +976,18 @@ def replay_artifact(
         try:
             enforce_allowlist(driver, step, artifact, allowlist, confirmed=approved)
         except AllowlistViolation as exc:
+            audit.log_event(EventType.ALLOWLIST_VIOLATION, "Action denied by allowlist",
+                            level="ERROR", step_number=step.step_number, data={"reason": exc.reason})
             if "requires human confirmation" in exc.reason:
+                audit.log_event(EventType.APPROVAL_REQUIRED, "Human confirmation required",
+                                level="WARNING", step_number=step.step_number)
                 return pause(StuckState(is_stuck=True, reason="Risky action requires human approval",
                                         current_step=step.step_number, recommended_action="Review action before proceeding"),
                              step.step_number - 2)
             return failure(step.step_number, f"Allowlist violation: {exc.reason}")
         if assessment.escalation_threshold and not approved:
+            audit.log_event(EventType.APPROVAL_REQUIRED, "Human approval required",
+                            level="WARNING", step_number=step.step_number)
             reason = (f"Critical risk: {assessment.reasoning}" if assessment.risk_level == RiskLevel.CRITICAL
                       else "Risky action requires human approval")
             return pause(StuckState(is_stuck=True, reason=reason,
@@ -977,9 +1034,17 @@ def replay_artifact(
                 if not wait_for_outcome(driver, step.expected_outcome, timeout_ms):
                     raise TimeoutException("Expected outcome timed out")
             except AllowlistViolation as exc:
+                audit.log_event(EventType.ALLOWLIST_VIOLATION, "Action left approved pages",
+                                level="ERROR", step_number=step.step_number, data={"reason": exc.reason})
                 return failure(step.step_number, f"Allowlist violation: {exc.reason}")
             except (ElementNotFoundError, WebDriverException, ValueError) as exc:
                 classification = detect_and_classify_error(driver, artifact, step.step_number, exc)
+                audit.log_step_executed(step.step_number, step.action,
+                                        asdict(step.locator) if step.locator else None,
+                                        round((time.monotonic() - step_started) * 1000),
+                                        assessment.risk_level.name, False)
+                audit.log_error(step.step_number, type(exc).__name__, "Action or outcome check failed",
+                                classification.classification, classification.should_continue)
                 if classification.classification == "expected_business_outcome":
                     session_manager.track_step_execution(lifecycle, step.step_number, False, round((time.monotonic() - step_started) * 1000), assessment.risk_level)
                     return business_outcome(step.step_number, classification)
@@ -998,6 +1063,10 @@ def replay_artifact(
             break
         record_step_in_history(step_history, {"step_number": step.step_number, "action": step.action, "success": True})
         session_manager.track_step_execution(lifecycle, step.step_number, True, round((time.monotonic() - step_started) * 1000), assessment.risk_level)
+        audit.log_step_executed(step.step_number, step.action,
+                                asdict(step.locator) if step.locator else None,
+                                round((time.monotonic() - step_started) * 1000),
+                                assessment.risk_level.name, True)
         if step.action in {"navigate", "click", "wait", "checkpoint"}:
             state = _current_replay_state(driver)
             decision = detect_stuck_state(artifact, step.step_number - 1, state, {}, tracker.get_history())
@@ -1019,9 +1088,14 @@ def replay_artifact(
                 enforce_allowlist(driver, guard, artifact, allowlist)
             verifier.verify(driver, checkpoint, final_resolver, timeout=max_wait_ms / 1000, step_number=final_index)
         except AllowlistViolation as exc:
+            audit.log_event(EventType.ALLOWLIST_VIOLATION, "Checkpoint page denied",
+                            level="ERROR", step_number=final_index, data={"reason": exc.reason})
             return failure(final_index, f"Allowlist violation: {exc.reason}")
         except (CheckpointVerificationError, ValueError, WebDriverException) as exc:
             classification = detect_and_classify_error(driver, artifact, final_index, exc)
+            audit.log_checkpoint(checkpoint.condition, False, checkpoint.expected_value, None)
+            audit.log_error(final_index, type(exc).__name__, "Success checkpoint did not pass",
+                            classification.classification, classification.should_continue)
             if classification.classification == "expected_business_outcome":
                 return business_outcome(final_index, classification)
             if maybe_recover(final_index, classification, final_resolver, attempt, False):
@@ -1031,6 +1105,7 @@ def replay_artifact(
                            exc.evidence if isinstance(exc, CheckpointVerificationError) else None)
         break
     logs.append("Success checkpoint passed")
+    audit.log_checkpoint(checkpoint.condition, True, checkpoint.expected_value, None)
 
     # A weak recorded checkpoint can still pass on a negative-result page.
     # Detect explicit business and hard-failure banners before returning data.
@@ -1055,9 +1130,13 @@ def replay_artifact(
                 enforce_allowlist(driver, guard, artifact, allowlist)
                 outputs[output.name] = extract_output(driver, resolved_output, output_resolver)
             except AllowlistViolation as exc:
+                audit.log_event(EventType.ALLOWLIST_VIOLATION, "Output extraction denied",
+                                level="ERROR", step_number=final_index, data={"reason": exc.reason})
                 return failure(final_index, f"Allowlist violation: {exc.reason}")
             except (ElementNotFoundError, WebDriverException, ValueError) as exc:
                 classification = detect_and_classify_error(driver, artifact, final_index, exc)
+                audit.log_error(final_index, type(exc).__name__, "Output extraction failed",
+                                classification.classification, classification.should_continue)
                 if classification.classification == "expected_business_outcome":
                     return business_outcome(final_index, classification)
                 if maybe_recover(final_index, classification, output_resolver, attempt, True):
@@ -1066,9 +1145,13 @@ def replay_artifact(
                 return failure(final_index, classification.error_message if classification.classification == "hard_failure" and classification.error_message and artifact.known_errors else default)
             break
         logs.append(f"Output {output.name} extracted")
+        audit.log_event(EventType.OUTPUT_EXTRACTED, "Declared output extracted",
+                        step_number=final_index, data={"field": output.name, "outputs": {output.name: outputs[output.name]}})
         LOGGER.info("replay_output", extra={"event": "replay_output", "artifact_id": artifact.id, "field": output.name})
     duration = time.monotonic() - started
     LOGGER.info("replay_completed", extra={"event": "replay_completed", "artifact_id": artifact.id, "duration_seconds": duration, "output_count": len(outputs)})
     session_manager.complete_session(lifecycle, outputs)
+    audit.log_business_outcome("success", outputs, duration)
+    audit.log_session_state(EventType.SESSION_COMPLETED, SessionLifecycle.COMPLETED, duration)
     return persist_lifecycle(ReplayResult(success=True, status="success", outputs=outputs, logs=logs,
                                          duration_seconds=duration, updated_artifact=artifact if handoff_session is not None else None))

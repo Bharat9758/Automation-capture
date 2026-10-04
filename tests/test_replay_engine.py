@@ -903,3 +903,54 @@ def test_known_hard_failure_preempts_passing_checkpoint(driver: Mock, artifact: 
     result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"})
     assert result.status == "hard_failure" and result.error == "Authentication failed"
     assert result.outputs == {} and result.step_failed == 5
+
+
+def test_replay_persists_redacted_step_checkpoint_and_completion_events(
+    driver: Mock, artifact: AutomationArtifact, tmp_path: Path,
+) -> None:
+    """The successful replay leaves an audit file without entered IDs or balances."""
+    result = replay_artifact(driver, artifact, {"member_id": "12345"})
+    assert result.audit_log_path is not None
+    events = json.loads(Path(result.audit_log_path).read_text(encoding="utf-8"))
+    kinds = [entry["event_type"] for entry in events]
+    assert kinds[:2] == ["SESSION_CREATED", "SESSION_STARTED"]
+    assert kinds.count("STEP_EXECUTED") == len(artifact.steps) + 1
+    assert "CHECKPOINT_VERIFIED" in kinds and "OUTPUT_EXTRACTED" in kinds
+    assert kinds[-1] == "SESSION_COMPLETED"
+    assert all(entry["session_id"] == result.session.session_id for entry in events)
+    assert "12345" not in json.dumps(events) and "5000" not in json.dumps(events)
+
+
+def test_replay_persists_escalation_and_resume_in_one_stream(
+    driver: Mock, artifact: AutomationArtifact,
+) -> None:
+    """Human approval and resumed execution extend the same session audit."""
+    initial = replay_artifact(driver, artifact, {"member_id": "12345"}, request_human_help=True)
+    assert initial.status == "escalated" and initial.audit_log_path is not None
+    assert any(item["event_type"] == "ESCALATION_TRIGGERED" for item in
+               json.loads(Path(initial.audit_log_path).read_text(encoding="utf-8")))
+    assert initial.handoff_session is not None
+    manager = SessionManager()
+    manager.give_control_to_human(initial.handoff_session)
+    manager.approve_resume(initial.handoff_session, resume_step=1)
+    manager.give_control_to_automation(initial.handoff_session)
+    resumed = replay_artifact(driver, artifact, {"member_id": "12345"},
+                              handoff_session=initial.handoff_session)
+    assert resumed.success and resumed.audit_log_path == initial.audit_log_path
+    kinds = [item["event_type"] for item in json.loads(Path(resumed.audit_log_path).read_text(encoding="utf-8"))]
+    assert "SESSION_PAUSED" in kinds and "SESSION_RESUMED" in kinds
+    assert kinds[-1] == "SESSION_COMPLETED"
+
+
+def test_resume_requires_prior_audit_file(driver: Mock, artifact: AutomationArtifact) -> None:
+    """An incomplete audit trail prevents continuation of a paused browser."""
+    initial = replay_artifact(driver, artifact, {"member_id": "12345"}, request_human_help=True)
+    assert initial.handoff_session is not None and initial.audit_log_path is not None
+    Path(initial.audit_log_path).unlink()
+    manager = SessionManager()
+    manager.give_control_to_human(initial.handoff_session)
+    manager.approve_resume(initial.handoff_session, resume_step=1)
+    manager.give_control_to_automation(initial.handoff_session)
+    with pytest.raises(ValidationError, match="Audit logger initialization failed"):
+        replay_artifact(driver, artifact, {"member_id": "12345"},
+                        handoff_session=initial.handoff_session)

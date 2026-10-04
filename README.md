@@ -147,3 +147,14 @@ Every `replay_artifact` run creates a UUID-based `ReplayResult.session` on the o
 On resume, pass the approved `handoff_session` to `replay_artifact`. It loads its matching lifecycle record, verifies the artifact and original live driver, and continues the same run ID. You may also pass `lifecycle_session=` to use an in-memory record. `load_session_metadata(path)` returns a detached audit; `load_session_metadata(path, original_driver)` reattaches the live browser after verifying its Selenium session ID. Saving a session cannot restore a browser that has closed.
 
 `list_sessions()` lists saved audits newest first. `cleanup_old_sessions(directory, days=None)` removes only **terminal** lifecycle JSON files older than the configured `SESSION_RETENTION_DAYS` (default 30). It leaves paused/running records, handoff files, and escalation evidence intact. Use `get_session_summary`, `get_full_session_report`, and `calculate_session_metrics` for reports without duplicating screenshots.
+
+## Phase 17 audit events
+
+Replay writes a redacted, session-scoped JSON event array to
+`LOG_DIRECTORY/<lifecycle-session-id>.json` (default `evidence/logs`). Events
+include the browser step, risk level, error classification, escalation,
+approval, checkpoint, and final outcome. Paused runs save their events; an
+approved resume appends to the same audit file. Logs and session metadata use
+the configured `REDACTION_LEVEL`, and screenshots and DOM snapshots stay in
+the separate private evidence path. `STRUCTURED_LOG_LEVEL` controls console
+output while preserving the complete event array.

@@ -49,7 +49,8 @@ _STRUCTURAL_KEYS = frozenset({"session_id", "escalation_id", "discovery_run_id",
                               "total_duration_seconds", "human_actions_total", "error_count", "escalations",
                               "action", "strategy", "risk_level", "classification", "event", "levelname",
                               "asctime", "taskName", "type", "required",
-                              "requires_approval", "escalation_threshold", "retry", "output_count", "input_count"})
+                              "requires_approval", "escalation_threshold", "retry", "output_count", "input_count",
+                              "passed", "recovery_attempted", "failure_step"})
 
 
 class RedactionLevel(IntEnum):
