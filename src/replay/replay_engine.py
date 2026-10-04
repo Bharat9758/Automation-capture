@@ -526,7 +526,8 @@ def replay_artifact(
     driver: WebDriver, artifact: AutomationArtifact, input_params: dict[str, Any], max_wait_ms: int = 10000,
     *, request_human_help: bool = False, escalation_directory: str | None = None,
     handoff_session: HandoffSession | None = None, lifecycle_session: SessionMetadata | None = None,
-    allowlist: AllowlistConfig | None = None,
+    allowlist: AllowlistConfig | None = None, evidence_capture_level: str = "ALL",
+    timeout_seconds: int | None = None,
 ) -> ReplayResult:
     """Validate, navigate, execute, verify, and extract an artifact without Claude.
 
@@ -543,6 +544,8 @@ def replay_artifact(
         lifecycle_session: Existing run lifecycle on resume, if held in memory.
             When omitted, it is loaded from SESSION_DIRECTORY by handoff ID.
         allowlist: Explicit reviewed rules; otherwise load ALLOWLIST_PATH.
+        evidence_capture_level: ALL, ERRORS, or ESCALATIONS_ONLY.
+        timeout_seconds: Optional overall replay time limit.
 
     Returns:
         Replay result with outputs or a hard failure and browser evidence.
@@ -555,6 +558,11 @@ def replay_artifact(
         raise ValidationError("artifact must be a valid AutomationArtifact")
     if isinstance(max_wait_ms, bool) or not isinstance(max_wait_ms, int) or max_wait_ms <= 0:
         raise ValidationError("max_wait_ms must be a positive integer")
+    if evidence_capture_level not in {"ALL", "ERRORS", "ESCALATIONS_ONLY"}:
+        raise ValidationError("Invalid evidence_capture_level")
+    if timeout_seconds is not None and (type(timeout_seconds) is not int or timeout_seconds <= 0):
+        raise ValidationError("timeout_seconds must be a positive integer")
+    deadline = started + timeout_seconds if timeout_seconds is not None else None
     if not isinstance(request_human_help, bool):
         raise ValidationError("request_human_help must be a boolean")
     if handoff_session is not None:
@@ -662,7 +670,7 @@ def replay_artifact(
         """
         result.session = lifecycle
         result.risk_assessments = list(assessments)
-        result.evidence_manifest_path = collector.manifest_path
+        result.evidence_manifest_path = collector.manifest_path if os.path.isfile(collector.manifest_path) else None
         result.evidence_capture_errors = list(capture_errors)
         try:
             save_session_metadata(lifecycle, os.path.join(session_directory, f"{lifecycle.session_id}.json"))
@@ -701,6 +709,8 @@ def replay_artifact(
             exc: Original browser exception.
             action: Recorded action for context.
         """
+        if evidence_capture_level == "ESCALATIONS_ONLY":
+            return
         try:
             collector.capture_error_context(step_number, exc, driver, action)
         except (OSError, WebDriverException, ValueError, TypeError, AttributeError) as capture_exc:
@@ -967,6 +977,8 @@ def replay_artifact(
 
     if handoff_session is None or handoff_session.resume_step == 0:
         try:
+            if deadline is not None and time.monotonic() >= deadline:
+                return failure(0, "Replay time limit reached")
             if not is_url_allowed(artifact.target_url, allowlist):
                 raise AllowlistViolation("Initial target URL is not allowlisted", action="navigate", current_url=artifact.target_url)
             if not allowlist.allow_new_urls and "navigate" not in get_allowed_actions_for_url(artifact.target_url, allowlist):
@@ -992,6 +1004,8 @@ def replay_artifact(
     for step in steps:
         if handoff_session is not None and step.step_number < handoff_session.resume_step:
             continue
+        if deadline is not None and time.monotonic() >= deadline:
+            return failure(step.step_number, "Replay time limit reached")
         if step.action == "navigate" and step.value:
             step = replace(step, value=urljoin(artifact.target_url, step.value))
         recorded = artifact.steps[step.step_number - 1]
@@ -1111,15 +1125,16 @@ def replay_artifact(
             break
         record_step_in_history(step_history, {"step_number": step.step_number, "action": step.action, "success": True})
         session_manager.track_step_execution(lifecycle, step.step_number, True, round((time.monotonic() - step_started) * 1000), assessment.risk_level)
-        try:
-            page_source = driver.page_source
-            state_metrics = _current_replay_state(driver)
-            collector.capture_performance_metrics(
-                step.step_number, round((time.monotonic() - step_started) * 1000),
-                int(state_metrics.get("element_count") or 0),
-                len(page_source.encode("utf-8")) if isinstance(page_source, str) else 0)
-        except (OSError, WebDriverException, ValueError, TypeError, AttributeError) as exc:
-            capture_errors.append(f"performance_metrics:{type(exc).__name__}")
+        if evidence_capture_level == "ALL":
+            try:
+                page_source = driver.page_source
+                state_metrics = _current_replay_state(driver)
+                collector.capture_performance_metrics(
+                    step.step_number, round((time.monotonic() - step_started) * 1000),
+                    int(state_metrics.get("element_count") or 0),
+                    len(page_source.encode("utf-8")) if isinstance(page_source, str) else 0)
+            except (OSError, WebDriverException, ValueError, TypeError, AttributeError) as exc:
+                capture_errors.append(f"performance_metrics:{type(exc).__name__}")
         audit.log_step_executed(step.step_number, step.action,
                                 asdict(step.locator) if step.locator else None,
                                 round((time.monotonic() - step_started) * 1000),
@@ -1133,6 +1148,8 @@ def replay_artifact(
                 return pause(decision, step.step_number - 1)
 
     final_index = len(steps) + 1
+    if deadline is not None and time.monotonic() >= deadline:
+        return failure(final_index, "Replay time limit reached")
     final_resolver = LocatorResolver(wait_timeout=max_wait_ms / 1000)
     verifier = CheckpointVerifier()
     for attempt in range(recovery_limit + 1):
@@ -1168,12 +1185,13 @@ def replay_artifact(
         break
     logs.append("Success checkpoint passed")
     audit.log_checkpoint(checkpoint.condition, True, checkpoint.expected_value, None)
-    for signal_name, capture in (("screenshot", collector.capture_screenshot),
-                                 ("dom", collector.capture_dom)):
-        try:
-            capture(driver, final_index, "verified_checkpoint")
-        except (OSError, WebDriverException, ValueError, TypeError, AttributeError) as exc:
-            capture_errors.append(f"{signal_name}:{type(exc).__name__}")
+    if evidence_capture_level == "ALL":
+        for signal_name, capture in (("screenshot", collector.capture_screenshot),
+                                     ("dom", collector.capture_dom)):
+            try:
+                capture(driver, final_index, "verified_checkpoint")
+            except (OSError, WebDriverException, ValueError, TypeError, AttributeError) as exc:
+                capture_errors.append(f"{signal_name}:{type(exc).__name__}")
 
     # A weak recorded checkpoint can still pass on a negative-result page.
     # Detect explicit business and hard-failure banners before returning data.

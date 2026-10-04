@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "automation-capture"
+version = "0.20.0"
+description = "Browser automation discovery and deterministic replay"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "selenium==4.15.2",
+  "anthropic==0.117.1",
+  "flask==3.0.0",
+  "python-dotenv==1.0.0",
+  "pydantic==2.5.0",
+  "python-json-logger==2.0.7",
+  "jsonschema==4.23.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest==7.4.0"]
+
+[project.scripts]
+automation-capture = "src.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.setuptools.package-data]
+"src.target_app" = ["templates/*.html", "static/*.css", "static/*.js", "fixtures/*.json"]

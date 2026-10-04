@@ -1,0 +1,21 @@
+{
+  "demo_username": "member",
+  "demo_password": "password",
+  "members": {
+    "12345": {
+      "name": "John Smith",
+      "account_number": "ACC-12345",
+      "savings_balance": 5000.00,
+      "checking_balance": 2500.00
+    },
+    "54321": {
+      "name": "Jane Doe",
+      "account_number": "ACC-54321",
+      "savings_balance": 10000.00,
+      "checking_balance": 1500.00
+    }
+  },
+  "recent_search_limit": 5,
+  "delayed_seconds": 0.25,
+  "flaky_failure_rate": 0.5
+}

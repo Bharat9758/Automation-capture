@@ -14,7 +14,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
+from flask import Flask, abort, current_app, flash, redirect, render_template, request, session, url_for
 from werkzeug.wrappers import Response
 
 from src.logging import get_logger
@@ -127,8 +127,9 @@ def _safe_scenario() -> str:
     Returns:
         One supported scenario.
     """
-    value = session.get("scenario", "success")
-    return value if value in SCENARIOS else "success"
+    default = current_app.config.get("DEFAULT_SCENARIO", "success")
+    value = session.get("scenario", default)
+    return value if value in SCENARIOS else default
 
 
 def _login_required() -> Response | None:
@@ -165,15 +166,18 @@ def create_app(config_override: Mapping[str, Any] | None = None) -> Flask:
         raise ValueError("FLASK_SECRET_KEY must be a unique secret of at least 32 characters")
     fixture_path = config.get("TARGET_APP_CONFIG_PATH", os.environ.get("TARGET_APP_CONFIG_PATH"))
     if fixture_path is None:
-        fixture_path = str(Path(__file__).resolve().parents[2] / "config" / "target_app.example.json")
+        fixture_path = str(Path(__file__).resolve().parent / "fixtures" / "example.json")
     if not isinstance(fixture_path, str) or not fixture_path:
         raise ValueError("TARGET_APP_CONFIG_PATH must be a valid path")
     settings = _load_settings(fixture_path)
+    scenario = config.get("DEFAULT_SCENARIO", "success")
+    if scenario not in SCENARIOS:
+        raise ValueError("DEFAULT_SCENARIO must be a supported test scenario")
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config.update(SECRET_KEY=secret, SESSION_COOKIE_HTTPONLY=True,
                       SESSION_COOKIE_SAMESITE="Lax",
                       SESSION_COOKIE_SECURE=bool(config.get("SESSION_COOKIE_SECURE", False)),
-                      TARGET_SETTINGS=settings)
+                      TARGET_SETTINGS=settings, DEFAULT_SCENARIO=scenario)
     app.config.update({key: value for key, value in config.items()
                        if key in {"TESTING", "FLAKY_RANDOM"}})
 

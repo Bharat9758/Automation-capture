@@ -191,3 +191,48 @@ optional; raw performance events are not represented as HAR. Evidence files
 contain unredacted page content and are written with owner-only permissions on
 POSIX. `ReplayResult.evidence_manifest_path` and `evidence_capture_errors`
 show where evidence was saved and which optional signals were unavailable.
+
+## Command-line interface (Phase 20)
+
+Install the package in an environment containing Python 3.11 or newer with
+`pip install -e .`. This installs the `automation-capture` command; use
+`python -m src.cli` from the repository root for the same interface. Configure
+`.env` from `config.example.env`; `--config path/to/file.env` selects a
+different dotenv file. Explicit environment variables take precedence. The
+CLI supports `--verbose`, `--quiet`, and `--log-file private.jsonl` both
+before and after a command.
+
+```bash
+automation-capture test-app --port 5000 --scenario success
+automation-capture discovery --url http://127.0.0.1:5000/ --goal "Log in and read a member balance" --output artifacts/member.json
+automation-capture validate artifacts/member.json
+automation-capture inspect artifacts/member.json
+automation-capture list-artifacts --directory artifacts
+automation-capture replay --artifact artifacts/member.json --params member_id=12345 --output result.json
+automation-capture export artifacts/member.json --format markdown --output member.md
+automation-capture escalations
+automation-capture version
+```
+
+`discover` is an alias for `discovery`. The local app needs a private
+`FLASK_SECRET_KEY`; discovery additionally needs `ANTHROPIC_API_KEY`.
+Browser operations require a locally available Chrome or Firefox installation
+with Selenium driver support and configured `ALLOWED_DOMAINS`. Replay also
+requires an existing, reviewed `ALLOWLIST_PATH` covering the artifact's
+navigation and element actions. For the demo, set the example allowlist path
+and include `127.0.0.1:5000` in `ALLOWED_DOMAINS`. The `--url` replay
+override changes the artifact target for that invocation, while the allowlist
+and domain checks still apply.
+
+Replay output files contain a redacted result summary. Use
+`--redaction-level` to select NONE, BASIC, STRICT, or PARANOID;
+`--evidence-capture` selects ALL, ERRORS, or ESCALATIONS_ONLY. The default
+redaction is STRICT and the default evidence mode is ERRORS. Browser evidence
+can contain raw page content; store evidence paths privately. The CLI closes
+its browser after each discovery or replay, so a paused escalation requires a
+separate persistent-driver integration to complete a live handoff.
+
+Exit codes are 0 for success or a legitimate business outcome, 1 for a failed
+operation, 2 for configuration or input errors, 3 for a missing file, 4 for
+an invalid artifact, and 130 for interruption. `test-app --debug` binds
+only to a loopback address and disables Flask's process reloader.
