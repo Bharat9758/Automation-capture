@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Home · AutomationCapture Test{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Test browser automation locally</h1>
+  <p>Practice login, member lookup, error handling, and deterministic replay with demo accounts.</p>
+  <div class="actions">
+    <a id="login_link" class="button" href="{{ url_for('login') }}">Go to Login</a>
+    <a id="member_search_link" class="button button-secondary" href="{{ url_for('member_search') }}">Test Member Search</a>
+  </div>
+</section>
+<section class="card">
+  <h2>Choose a test scenario</h2>
+  <p>Selection is saved in this browser session.</p>
+  <div class="scenario-list">
+    {% for name in scenarios %}
+      <a class="scenario-link {% if scenario == name %}selected{% endif %}"
+         href="{{ url_for('index', scenario=name) }}" aria-label="Select {{ name }} scenario">{{ name|replace('_', ' ')|title }}</a>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}

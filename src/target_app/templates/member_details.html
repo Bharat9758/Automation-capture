@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Member details · AutomationCapture Test{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Member details</h1>
+  <dl class="details">
+    <dt>Name</dt><dd id="member_name">{{ member.name }}</dd>
+    <dt>Member ID</dt><dd id="member_id_display">{{ member.member_id }}</dd>
+    <dt>Account number</dt><dd id="account_number">{{ member.account_number }}</dd>
+    <dt>Savings balance</dt><dd id="savings_balance">${{ '%.2f'|format(member.savings_balance) }}</dd>
+    <dt>Checking balance</dt><dd id="checking_balance">${{ '%.2f'|format(member.checking_balance) }}</dd>
+  </dl>
+  <div class="actions">
+    <a class="button button-secondary" href="{{ url_for('member_search') }}">Search again</a>
+    <a id="logout_btn" class="button" href="{{ url_for('logout') }}">Logout</a>
+  </div>
+</section>
+{% endblock %}

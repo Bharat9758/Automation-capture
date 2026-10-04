@@ -20,7 +20,7 @@ Set `ALLOWLIST_PATH` to a reviewed JSON file for the target application. Copy `c
 
 Global forbidden keywords deny actions. Actions requiring confirmation pause for human review; an operator can perform the step in the existing session and explicitly resume at the next step. Keep `allow_new_urls` and `allow_unknown_elements` false. An optional local bypass requires `ALLOWLIST_MODE=development` and identical nonempty `ALLOWLIST_BYPASS_TOKEN` and `ALLOWLIST_BYPASS_PRESENTED_TOKEN`. Production mode ignores bypass tokens. The example covers only member search; add every target and destination path for other workflows.
 
-AutomationCapture discovers browser workflows with a Claude-guided Selenium agent and records reusable artifacts for later deterministic replay. Phases 2 through 13 add page observation, browser actions, a bounded discovery loop, a versioned artifact schema, recording, JSON file persistence, robust locator resolution, deterministic replay, runtime outcome classification, checkpoint verification, stuck state detection, escalation requests, a mock human handoff, and session lifecycle tracking. The Flask target application will be implemented in later phases.
+AutomationCapture discovers browser workflows with a Claude-guided Selenium agent and records reusable artifacts for later deterministic replay. Phases 2 through 13 add page observation, browser actions, a bounded discovery loop, a versioned artifact schema, recording, JSON file persistence, robust locator resolution, deterministic replay, runtime outcome classification, checkpoint verification, stuck state detection, escalation requests, a mock human handoff, and session lifecycle tracking. Phase 19 includes a local Flask fixture for browser testing.
 
 ## Development setup
 
@@ -158,6 +158,25 @@ approved resume appends to the same audit file. Logs and session metadata use
 the configured `REDACTION_LEVEL`, and screenshots and DOM snapshots stay in
 the separate private evidence path. `STRUCTURED_LOG_LEVEL` controls console
 output while preserving the complete event array.
+
+## Local Flask test app (Phase 19)
+
+Set `FLASK_SECRET_KEY` in `.env` to a unique value of at least 32 characters;
+generate one with `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
+Then run `python -m src.target_app.local_app` from the project root and open
+`http://127.0.0.1:5000/`. The server binds to loopback only. Use the demo
+credentials and two sample members in `config/target_app.example.json`; never
+put real credentials or account data in this fixture. `TARGET_APP_CONFIG_PATH`
+can point to a different local fixture. The app's five selectable scenarios
+are success, not found, invalid input, delayed, and flaky. Selection persists
+in that browser session. Flask renders a CSRF token in each form automatically.
+
+For deterministic replay, set `ALLOWLIST_PATH=config/target_app.allowlist.example.json`
+and keep `127.0.0.1:5000` in `ALLOWED_DOMAINS`. The sample allowlist includes
+the login and search inputs, buttons, error labels, and member balance fields.
+The fixture is verified with `pytest tests/test_local_app.py` using Flask's
+test client. `TARGET_APP_HOST` and `TARGET_APP_PORT` configure the local bind;
+host choices are limited to loopback addresses.
 
 ## Phase 18 evidence capture
 

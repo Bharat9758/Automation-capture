@@ -1,0 +1,31 @@
+:root { color-scheme: light; --ink: #18243a; --accent: #215aca; --surface: #fff; --backdrop: #f2f5fa; --error: #aa1d2e; --success: #146737; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--backdrop); color: var(--ink); font: 16px/1.5 system-ui, sans-serif; }
+a { color: var(--accent); }
+a:focus-visible, button:focus-visible, input:focus-visible { outline: 3px solid #f2a900; outline-offset: 2px; }
+.site-header { background: #142944; color: #fff; }
+.site-header nav { max-width: 960px; margin: auto; padding: 16px 24px; display: flex; justify-content: space-between; gap: 24px; align-items: center; }
+.site-header a { color: #fff; text-decoration: none; }
+.brand { font-weight: 700; }
+.nav-links, .actions, .scenario-list { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.container { max-width: 960px; margin: 32px auto; padding: 0 24px; }
+.card { background: var(--surface); padding: 28px; border-radius: 12px; box-shadow: 0 4px 18px #14294415; margin-bottom: 20px; }
+h1, h2 { margin-top: 0; line-height: 1.25; }
+.form-card { max-width: 560px; }
+label { display: block; font-weight: 600; margin: 16px 0 6px; }
+input:not([type=hidden]) { display: block; width: 100%; padding: 11px 12px; border: 1px solid #8996a8; border-radius: 6px; font: inherit; }
+button, .button, .scenario-link { cursor: pointer; display: inline-block; font: inherit; border-radius: 6px; text-decoration: none; }
+.button { background: var(--accent); color: #fff; border: 1px solid var(--accent); padding: 10px 18px; margin-top: 18px; }
+.button:hover { background: #154496; }
+.button-secondary, .scenario-link { background: #fff; color: var(--accent); border: 1px solid var(--accent); }
+.button-secondary:hover, .scenario-link:hover { background: #eaf0ff; }
+.scenario-link { padding: 8px 12px; }
+.scenario-link.selected { border-width: 2px; font-weight: 700; }
+.error-message, .flash-warning { color: var(--error); background: #fff0f1; border-left: 4px solid var(--error); padding: 12px; }
+.success-message { color: var(--success); background: #e8f6ed; padding: 12px; }
+.flash { margin-bottom: 20px; }
+.details { display: grid; grid-template-columns: minmax(130px, 180px) 1fr; gap: 10px 20px; }
+.details dt { font-weight: 600; }
+.details dd { margin: 0; }
+.site-footer { max-width: 960px; margin: 32px auto; padding: 0 24px; color: #526179; }
+@media (max-width: 520px) { .site-header nav, .details { display: block; } .nav-links { margin-top: 12px; } .details dd { margin-bottom: 12px; } }

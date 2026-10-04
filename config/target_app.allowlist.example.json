@@ -1,0 +1,79 @@
+{
+  "pages": [
+    {
+      "url_pattern": "/",
+      "domain": "127.0.0.1:5000",
+      "page_name": "home",
+      "description": "Local demo home",
+      "allowed_actions": ["navigate", "click", "read", "wait", "checkpoint"],
+      "allowed_elements": [
+        {"element_id": "login_link", "locator": {"strategy": "id", "value": "login_link"}, "action": "click", "description": "Open login"},
+        {"element_id": "member_search_link", "locator": {"strategy": "id", "value": "member_search_link"}, "action": "click", "description": "Open member search"}
+      ]
+    },
+    {
+      "url_pattern": "/login",
+      "domain": "127.0.0.1:5000",
+      "page_name": "login",
+      "description": "Local demo login",
+      "allowed_actions": ["navigate", "click", "type", "read", "wait", "checkpoint"],
+      "allowed_elements": [
+        {"element_id": "username_input", "locator": {"strategy": "id", "value": "username_input"}, "action": "type", "description": "Demo username"},
+        {"element_id": "password_input", "locator": {"strategy": "id", "value": "password_input"}, "action": "type", "description": "Demo password"},
+        {"element_id": "login_btn", "locator": {"strategy": "id", "value": "login_btn"}, "action": "click", "description": "Submit login"},
+        {"element_id": "login_error", "locator": {"strategy": "id", "value": "login_error"}, "action": "read", "description": "Login error"}
+      ]
+    },
+    {
+      "url_pattern": "/members/search",
+      "domain": "127.0.0.1:5000",
+      "page_name": "member_search",
+      "description": "Local demo member search",
+      "allowed_actions": ["navigate", "click", "type", "read", "wait", "checkpoint"],
+      "allowed_elements": [
+        {"element_id": "member_id_search", "locator": {"strategy": "id", "value": "member_id_search"}, "action": "type", "description": "Member ID entry"},
+        {"element_id": "search_btn", "locator": {"strategy": "id", "value": "search_btn"}, "action": "click", "description": "Submit search"},
+        {"element_id": "search_error", "locator": {"strategy": "id", "value": "search_error"}, "action": "read", "description": "Search result message"}
+      ]
+    },
+    {
+      "url_pattern": "regex:^/members/[0-9]+$",
+      "domain": "127.0.0.1:5000",
+      "page_name": "member_details",
+      "description": "Local demo member balances",
+      "allowed_actions": ["navigate", "click", "read", "wait", "checkpoint"],
+      "allowed_elements": [
+        {"element_id": "member_name", "locator": {"strategy": "id", "value": "member_name"}, "action": "read", "description": "Member name"},
+        {"element_id": "member_id_display", "locator": {"strategy": "id", "value": "member_id_display"}, "action": "read", "description": "Member ID"},
+        {"element_id": "account_number", "locator": {"strategy": "id", "value": "account_number"}, "action": "read", "description": "Account number"},
+        {"element_id": "savings_balance", "locator": {"strategy": "id", "value": "savings_balance"}, "action": "read", "description": "Savings balance"},
+        {"element_id": "checking_balance", "locator": {"strategy": "id", "value": "checking_balance"}, "action": "read", "description": "Checking balance"},
+        {"element_id": "logout_btn", "locator": {"strategy": "id", "value": "logout_btn"}, "action": "click", "description": "End demo session"}
+      ]
+    },
+    {
+      "url_pattern": "/error",
+      "domain": "127.0.0.1:5000",
+      "page_name": "error",
+      "description": "Demo error result",
+      "allowed_actions": ["navigate", "read", "wait", "checkpoint"],
+      "allowed_elements": [
+        {"element_id": "error_message", "locator": {"strategy": "id", "value": "error_message"}, "action": "read", "description": "Error message"}
+      ]
+    },
+    {
+      "url_pattern": "/success",
+      "domain": "127.0.0.1:5000",
+      "page_name": "success",
+      "description": "Demo success result",
+      "allowed_actions": ["navigate", "read", "wait", "checkpoint"],
+      "allowed_elements": [
+        {"element_id": "success_message", "locator": {"strategy": "id", "value": "success_message"}, "action": "read", "description": "Success message"}
+      ]
+    }
+  ],
+  "global_forbidden_keywords": ["delete", "close_account", "remove", "transfer", "unsubscribe", "deactivate"],
+  "require_confirmation_for": ["delete", "close", "transfer", "remove"],
+  "allow_new_urls": false,
+  "allow_unknown_elements": false
+}

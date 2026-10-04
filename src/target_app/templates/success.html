@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Success · AutomationCapture Test{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Success</h1>
+  <p id="success_message" class="success-message" role="status">{{ message }}</p>
+  <a class="button" href="{{ url_for('member_search') }}">Try member search</a>
+</section>
+{% endblock %}

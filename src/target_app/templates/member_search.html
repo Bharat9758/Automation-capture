@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Member search · AutomationCapture Test{% endblock %}
+{% block content %}
+<section class="card form-card">
+  <h1>Member search</h1>
+  <p>Enter a numeric demo member ID.</p>
+  {% if error %}<p class="error-message" id="search_error" role="alert">{{ error }}</p>{% endif %}
+  <form id="member_search_form" method="post" action="{{ url_for('member_search') }}" novalidate>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label for="member_id_search">Member ID</label>
+    <input id="member_id_search" name="member_id" inputmode="numeric" type="text" value="{{ member_id }}" autocomplete="off">
+    <button id="search_btn" class="button" type="submit">Search</button>
+  </form>
+</section>
+<section class="card" id="recent_searches">
+  <h2>Recent successful searches</h2>
+  {% if recent %}
+    <ul>{% for member in recent %}<li><a href="{{ url_for('member_details', member_id=member) }}">{{ member }}</a></li>{% endfor %}</ul>
+  {% else %}
+    <p>No recent searches.</p>
+  {% endif %}
+</section>
+{% endblock %}

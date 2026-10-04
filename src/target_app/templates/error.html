@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Error · AutomationCapture Test{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Something went wrong</h1>
+  <p id="error_message" class="error-message" role="alert">{{ message }}</p>
+  <a class="button button-secondary" href="{{ url_for('index') }}">Back to home</a>
+</section>
+{% endblock %}

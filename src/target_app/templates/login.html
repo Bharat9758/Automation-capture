@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Login · AutomationCapture Test{% endblock %}
+{% block content %}
+<section class="card form-card">
+  <h1>Demo login</h1>
+  <p>Use the configured demo credentials to continue.</p>
+  {% if error %}<p class="error-message" id="login_error" role="alert">{{ error }}</p>{% endif %}
+  <form id="login_form" method="post" action="{{ url_for('login') }}" novalidate>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label for="username_input">Username</label>
+    <input id="username_input" name="username" type="text" autocomplete="username">
+    <label for="password_input">Password</label>
+    <input id="password_input" name="password" type="password" autocomplete="current-password">
+    <button id="login_btn" class="button" type="submit">Login</button>
+  </form>
+</section>
+{% endblock %}
