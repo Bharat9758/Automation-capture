@@ -158,3 +158,17 @@ approved resume appends to the same audit file. Logs and session metadata use
 the configured `REDACTION_LEVEL`, and screenshots and DOM snapshots stay in
 the separate private evidence path. `STRUCTURED_LOG_LEVEL` controls console
 output while preserving the complete event array.
+
+## Phase 18 evidence capture
+
+Replay saves private browser evidence under `EVIDENCE_DIRECTORY/<session-id>`
+(default `evidence/capture`). Step timings are recorded in `metrics/`; a passed
+final checkpoint adds a PNG and DOM snapshot. Failures retain immediate
+exception context, traceback, screenshot, and DOM. Escalations create a
+dedicated folder with all available browser signals and a capture manifest.
+`index.json` lists evidence paths, timestamps, byte sizes, and SHA-256 hashes
+without duplicating page content. Selenium browser logs and HAR exports are
+optional; raw performance events are not represented as HAR. Evidence files
+contain unredacted page content and are written with owner-only permissions on
+POSIX. `ReplayResult.evidence_manifest_path` and `evidence_capture_errors`
+show where evidence was saved and which optional signals were unavailable.

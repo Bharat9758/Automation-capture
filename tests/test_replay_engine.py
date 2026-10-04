@@ -85,6 +85,7 @@ def driver(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Mock:
     monkeypatch.setenv("ESCALATION_DIRECTORY", str(tmp_path / "evidence" / "escalations"))
     monkeypatch.setenv("HANDOFF_DIRECTORY", str(tmp_path / "evidence" / "handoffs"))
     monkeypatch.setenv("SESSION_DIRECTORY", str(tmp_path / "evidence" / "sessions"))
+    monkeypatch.setenv("EVIDENCE_DIRECTORY", str(tmp_path / "evidence" / "capture"))
     rules = {"pages": [
         {"url_pattern": route, "domain": "banking.example.com", "page_name": route, "description": "Test page",
          "allowed_actions": ["navigate", "click", "type", "read", "wait", "checkpoint"],
@@ -954,3 +955,33 @@ def test_resume_requires_prior_audit_file(driver: Mock, artifact: AutomationArti
     with pytest.raises(ValidationError, match="Audit logger initialization failed"):
         replay_artifact(driver, artifact, {"member_id": "12345"},
                         handoff_session=initial.handoff_session)
+
+
+def test_replay_indexes_private_metrics_and_checkpoint_evidence(
+    driver: Mock, artifact: AutomationArtifact, tmp_path: Path,
+) -> None:
+    """Step metrics and final verification signals share a private session index."""
+    result = replay_artifact(driver, artifact, {"member_id": "12345"})
+    assert result.success and result.evidence_manifest_path is not None
+    index = json.loads(Path(result.evidence_manifest_path).read_text(encoding="utf-8"))
+    kinds = [item["evidence_type"] for item in index["evidence"]]
+    assert kinds.count("PERFORMANCE_METRICS") == len(artifact.steps)
+    assert "SCREENSHOT" in kinds and "DOM_SNAPSHOT" in kinds
+    assert index["session_id"] == result.session.session_id
+    assert "12345" not in json.dumps(index)
+    assert not result.evidence_capture_errors
+
+
+def test_replay_failure_creates_private_escalation_evidence(
+    driver: Mock, artifact: AutomationArtifact,
+) -> None:
+    """A hard failure keeps immediate context and its escalation folder."""
+    payload = artifact.to_dict()
+    payload["steps"][1]["locator"]["value"] = "missing"
+    result = replay_artifact(driver, AutomationArtifact.from_dict(payload), {"member_id": "12345"}, max_wait_ms=30)
+    assert result.status == "hard_failure" and result.evidence_manifest_path is not None
+    index = json.loads(Path(result.evidence_manifest_path).read_text(encoding="utf-8"))
+    kinds = {item["evidence_type"] for item in index["evidence"]}
+    assert "ERROR_CONTEXT" in kinds and "SCREENSHOT" in kinds and "DOM_SNAPSHOT" in kinds
+    assert result.escalation_request is not None
+    assert Path(result.evidence["capture_paths"]["manifest_path"]).is_file()

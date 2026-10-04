@@ -41,6 +41,7 @@ from src.escalation.stuck_detector import (
     record_step_in_history,
 )
 from src.logging import get_logger
+from src.logging.evidence_capture import EvidenceCollector
 from src.logging.structured_logger import (
     EventType, StructuredLogger, load_logs_from_file, save_logs_to_file,
 )
@@ -88,6 +89,8 @@ class ReplayResult:
     session: SessionMetadata | None = None
     risk_assessments: list[ActionRiskAssessment] = field(default_factory=list)
     audit_log_path: str | None = None
+    evidence_manifest_path: str | None = None
+    evidence_capture_errors: list[str] = field(default_factory=list)
 
 
 def _current_replay_state(driver: WebDriver) -> dict[str, Any]:
@@ -638,6 +641,13 @@ def replay_artifact(
         for prior_approval in handoff_session.risk_approvals:
             audit.log_approval(handoff_session.escalation_id, prior_approval.step_number, True,
                                prior_approval.approved_by, "Human approved the paused step")
+    try:
+        collector = EvidenceCollector(lifecycle.session_id,
+                                      os.environ.get("EVIDENCE_DIRECTORY", "evidence/capture"),
+                                      redaction_policy)
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValidationError(f"Evidence collector initialization failed: {type(exc).__name__}") from exc
+    capture_errors: list[str] = []
     assessments: list[ActionRiskAssessment] = []
     risk_errors: list[dict[str, Any]] = [entry for entry in lifecycle.step_executions if entry.get("success") is False]
 
@@ -652,6 +662,8 @@ def replay_artifact(
         """
         result.session = lifecycle
         result.risk_assessments = list(assessments)
+        result.evidence_manifest_path = collector.manifest_path
+        result.evidence_capture_errors = list(capture_errors)
         try:
             save_session_metadata(lifecycle, os.path.join(session_directory, f"{lifecycle.session_id}.json"))
             result.audit_log_path = save_logs_to_file(audit, audit_path)
@@ -680,6 +692,34 @@ def replay_artifact(
     LOGGER.info("replay_inputs_valid", extra={"event": "replay_inputs_valid", "artifact_id": artifact.id, "input_count": len(input_params)})
     tracker = StateTracker()
     step_history: list[dict[str, Any]] = []
+
+    def capture_error(step_number: int, exc: Exception, action: ActionStep) -> None:
+        """Keep immediate raw failure context without hiding the original error.
+
+        Args:
+            step_number: Failed action number.
+            exc: Original browser exception.
+            action: Recorded action for context.
+        """
+        try:
+            collector.capture_error_context(step_number, exc, driver, action)
+        except (OSError, WebDriverException, ValueError, TypeError, AttributeError) as capture_exc:
+            capture_errors.append(f"error_context:{type(capture_exc).__name__}")
+
+    def capture_escalation(escalation_id: str, step_number: int, stuck: StuckState) -> dict[str, Any]:
+        """Save private handoff signals tied to the escalation ID.
+
+        Args:
+            escalation_id: Saved request identifier.
+            step_number: Current paused step.
+            stuck: Human handoff context.
+
+        Returns:
+            Signal paths and per-signal capture errors.
+        """
+        result = collector.capture_on_escalation(driver, step_number, escalation_id, stuck)
+        capture_errors.extend(f"{name}:{error}" for name, error in result["capture_errors"].items())
+        return result
 
     def create_handoff(request: EscalationRequest) -> HandoffSession:
         """Persist paused control state for the original live browser.
@@ -788,6 +828,8 @@ def replay_artifact(
             })
             handoff = create_handoff(request)
             session_manager.pause_session(lifecycle, request)
+            evidence["capture_paths"] = capture_escalation(request.escalation_id,
+                                                           hydrated.current_step, hydrated)
             audit.log_escalation(hydrated.reason, hydrated.current_step, request.escalation_id,
                                  assessments[-1].risk_level.name if assessments else "UNKNOWN")
             audit.log_session_state(EventType.SESSION_PAUSED, SessionLifecycle.PAUSED,
@@ -836,6 +878,8 @@ def replay_artifact(
             request = build_escalation(hydrated, pending=True)
             handoff = create_handoff(request)
             session_manager.add_escalation_to_session(lifecycle, request)
+            evidence["capture_paths"] = capture_escalation(request.escalation_id,
+                                                           hydrated.current_step, hydrated)
             audit.log_escalation(hydrated.reason, hydrated.current_step, request.escalation_id,
                                  assessments[-1].risk_level.name if assessments else "UNKNOWN")
         except (OSError, ValueError, TypeError) as exc:
@@ -935,6 +979,9 @@ def replay_artifact(
                                     "SAFE", True)
             LOGGER.info("replay_navigated", extra={"event": "replay_navigated", "artifact_id": artifact.id})
         except (WebDriverException, ValueError, AllowlistViolation) as exc:
+            navigation_step = ActionStep(step_number=1, action="navigate", locator=None,
+                                         value=artifact.target_url, reasoning="Initial navigation", expected_outcome="Page ready")
+            capture_error(0, exc, navigation_step)
             audit.log_error(0, type(exc).__name__, "Initial navigation failed", "hard_failure", False)
             return failure(0, f"Initial navigation failed: {type(exc).__name__}")
     else:
@@ -1038,6 +1085,7 @@ def replay_artifact(
                                 level="ERROR", step_number=step.step_number, data={"reason": exc.reason})
                 return failure(step.step_number, f"Allowlist violation: {exc.reason}")
             except (ElementNotFoundError, WebDriverException, ValueError) as exc:
+                capture_error(step.step_number, exc, recorded)
                 classification = detect_and_classify_error(driver, artifact, step.step_number, exc)
                 audit.log_step_executed(step.step_number, step.action,
                                         asdict(step.locator) if step.locator else None,
@@ -1063,6 +1111,15 @@ def replay_artifact(
             break
         record_step_in_history(step_history, {"step_number": step.step_number, "action": step.action, "success": True})
         session_manager.track_step_execution(lifecycle, step.step_number, True, round((time.monotonic() - step_started) * 1000), assessment.risk_level)
+        try:
+            page_source = driver.page_source
+            state_metrics = _current_replay_state(driver)
+            collector.capture_performance_metrics(
+                step.step_number, round((time.monotonic() - step_started) * 1000),
+                int(state_metrics.get("element_count") or 0),
+                len(page_source.encode("utf-8")) if isinstance(page_source, str) else 0)
+        except (OSError, WebDriverException, ValueError, TypeError, AttributeError) as exc:
+            capture_errors.append(f"performance_metrics:{type(exc).__name__}")
         audit.log_step_executed(step.step_number, step.action,
                                 asdict(step.locator) if step.locator else None,
                                 round((time.monotonic() - step_started) * 1000),
@@ -1092,6 +1149,11 @@ def replay_artifact(
                             level="ERROR", step_number=final_index, data={"reason": exc.reason})
             return failure(final_index, f"Allowlist violation: {exc.reason}")
         except (CheckpointVerificationError, ValueError, WebDriverException) as exc:
+            checkpoint_step = ActionStep(step_number=final_index, action="checkpoint",
+                                         locator=checkpoint.locator,
+                                         value=None if checkpoint.locator else "url_matches:.",
+                                         reasoning="Final verification", expected_outcome="Checkpoint passed")
+            capture_error(final_index, exc, checkpoint_step)
             classification = detect_and_classify_error(driver, artifact, final_index, exc)
             audit.log_checkpoint(checkpoint.condition, False, checkpoint.expected_value, None)
             audit.log_error(final_index, type(exc).__name__, "Success checkpoint did not pass",
@@ -1106,6 +1168,12 @@ def replay_artifact(
         break
     logs.append("Success checkpoint passed")
     audit.log_checkpoint(checkpoint.condition, True, checkpoint.expected_value, None)
+    for signal_name, capture in (("screenshot", collector.capture_screenshot),
+                                 ("dom", collector.capture_dom)):
+        try:
+            capture(driver, final_index, "verified_checkpoint")
+        except (OSError, WebDriverException, ValueError, TypeError, AttributeError) as exc:
+            capture_errors.append(f"{signal_name}:{type(exc).__name__}")
 
     # A weak recorded checkpoint can still pass on a negative-result page.
     # Detect explicit business and hard-failure banners before returning data.
@@ -1134,6 +1202,10 @@ def replay_artifact(
                                 level="ERROR", step_number=final_index, data={"reason": exc.reason})
                 return failure(final_index, f"Allowlist violation: {exc.reason}")
             except (ElementNotFoundError, WebDriverException, ValueError) as exc:
+                output_step = ActionStep(step_number=final_index, action="read_text",
+                                         locator=resolved_output.extraction_locator, value=None,
+                                         reasoning="Extract declared output", expected_outcome="Output read")
+                capture_error(final_index, exc, output_step)
                 classification = detect_and_classify_error(driver, artifact, final_index, exc)
                 audit.log_error(final_index, type(exc).__name__, "Output extraction failed",
                                 classification.classification, classification.should_continue)

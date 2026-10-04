@@ -225,3 +225,6 @@ evidence/handoffs/
 
 # Session lifecycle audits can contain nested browser evidence and outputs.
 evidence/sessions/
+
+evidence/logs/
+evidence/capture/
