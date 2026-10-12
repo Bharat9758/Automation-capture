@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest==7.4.0"]
+test = ["pytest==7.4.0", "pytest-cov==7.1.0"]
 
 [project.scripts]
 automation-capture = "src.cli:main"

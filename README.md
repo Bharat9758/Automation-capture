@@ -330,3 +330,21 @@ Exit codes are 0 for success or a legitimate business outcome, 1 for a failed
 operation, 2 for configuration or input errors, 3 for a missing file, 4 for
 an invalid artifact, and 130 for interruption. `test-app --debug` binds
 only to a loopback address and disables Flask's process reloader.
+
+## Testing
+
+Install test dependencies with `python -m pip install -e '.[test]'` (or
+`python -m pip install -r requirements.txt`). Run the complete suite with
+`pytest tests/ -q`, or select a component with
+`pytest tests/test_core_integration.py -q`. Generate the line coverage report
+with `pytest tests/ --cov=src --cov-report=html --cov-report=term-missing` and
+open `htmlcov/index.html` locally.
+
+The Phases 22–26 run passed 300 tests with 86% overall statement coverage.
+The replay engine measured 83% and the safety package 87%; the aspirational
+100% replay and 95% safety thresholds are still open. See
+[coverage results](tests/COVERAGE.md) for component measurements and gaps, and
+the [testing guide](tests/TEST_GUIDE.md) for fixtures, mock boundaries, and
+instructions for adding workflow tests. The suite uses mocked Selenium and
+Claude boundaries plus Flask's in-process client; it does not exercise a live
+browser or Anthropic account.
