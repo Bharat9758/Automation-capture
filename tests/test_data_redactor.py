@@ -167,6 +167,10 @@ def test_policy_loading_and_fail_closed_logger(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setenv("REDACTION_LEVEL", "NONE")
     with pytest.raises(ValueError, match="development"):
         load_redaction_policy()
+    monkeypatch.setenv("ALLOWLIST_MODE", "development")
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    with pytest.raises(ValueError, match="development"):
+        load_redaction_policy()
     monkeypatch.setenv("REDACTION_LEVEL", "STRICT")
     logger = get_logger("test_phase16_redaction")
     stream = io.StringIO()

@@ -116,7 +116,10 @@ def load_redaction_policy(level: str | RedactionLevel | None = None) -> Redactio
         selected = candidate if isinstance(candidate, RedactionLevel) else RedactionLevel[str(candidate).upper()]
     except KeyError as exc:
         raise ValueError("REDACTION_LEVEL must be NONE, BASIC, STRICT, or PARANOID") from exc
-    if selected == RedactionLevel.NONE and os.environ.get("ALLOWLIST_MODE", "production") != "development":
+    if selected == RedactionLevel.NONE and (
+        os.environ.get("ENVIRONMENT", "development") != "development"
+        or os.environ.get("ALLOWLIST_MODE", "production") != "development"
+    ):
         raise ValueError("NONE redaction is available only in development mode")
     try:
         fields = json.loads(os.environ["REDACTION_FIELDS"]) if "REDACTION_FIELDS" in os.environ else list(SENSITIVE_FIELDS)

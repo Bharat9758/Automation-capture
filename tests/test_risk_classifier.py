@@ -65,6 +65,17 @@ def test_action_baselines(artifact: AutomationArtifact, action: str, expected: R
     assert not assessment.escalation_threshold
 
 
+def test_configured_approval_floor(artifact: AutomationArtifact, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stricter configured threshold pauses routine actions for review."""
+    monkeypatch.setenv("RISK_APPROVAL_REQUIRED", "CAUTION")
+    caution = classify_action_risk(_step(3, action="type"), artifact, 3, [], [])
+    assert caution.risk_level == RiskLevel.CAUTION
+    assert caution.requires_approval and caution.escalation_threshold
+    monkeypatch.setenv("RISK_APPROVAL_REQUIRED", "invalid")
+    with pytest.raises(ValueError, match="RISK_APPROVAL_REQUIRED"):
+        classify_action_risk(_step(3), artifact, 3, [], [])
+
+
 def test_cumulative_keywords_are_value_free(artifact: AutomationArtifact) -> None:
     """Independent locator and reasoning signals accumulate to critical."""
     step = _step(3, locator="delete_account_confirm_button", reasoning="confirm and close account")

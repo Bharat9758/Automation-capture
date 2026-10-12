@@ -353,7 +353,7 @@ def handle_replay(args: argparse.Namespace, config: dict[str, Any]) -> int:
     with progress("Replaying artifact", args.quiet):
         driver = create_driver(config)
         try:
-            result = replay_artifact(driver, artifact, params, max_wait_ms=config["selenium_timeout_ms"],
+            result = replay_artifact(driver, artifact, params, max_wait_ms=config["locator_timeout_seconds"] * 1000,
                                      evidence_capture_level=capture,
                                      timeout_seconds=config["replay_timeout_seconds"])
         finally:

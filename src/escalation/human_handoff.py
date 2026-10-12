@@ -218,7 +218,7 @@ class SessionManager:
         if session.in_control != "human":
             raise RuntimeError("Only the controlling human can approve an escalated step")
         if (not isinstance(approval, RiskApproval) or approval.step_number != session.paused_step
-                or approval.risk_level < RiskLevel.RISKY or approval.approval_method != "human_interactive"
+                or approval.approval_method != "human_interactive"
                 or _parse_time(approval.approved_at) < session.paused_at):
             raise ValueError("Risk approval must match the current paused step and handoff")
         if any(item.step_number == approval.step_number for item in session.risk_approvals):
@@ -562,8 +562,7 @@ def load_handoff_session(filepath: str, driver: WebDriver | None = None) -> Hand
                 or isinstance(session.paused_step, bool) or not isinstance(session.paused_step, int)
                 or session.paused_step < 0 or session.resume_step < session.paused_step):
             raise ValueError("Invalid handoff identifiers or replay step")
-        if any(approval.step_number != session.paused_step or approval.risk_level < RiskLevel.RISKY
-               or approval.approval_method != "human_interactive" or
+        if any(approval.step_number != session.paused_step or approval.approval_method != "human_interactive" or
                _parse_time(approval.approved_at) < session.paused_at for approval in session.risk_approvals):
             raise ValueError("Invalid risk approval for handoff")
         return session

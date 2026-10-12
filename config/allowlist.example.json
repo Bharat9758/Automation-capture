@@ -2,14 +2,14 @@
   "pages": [
     {
       "url_pattern": "/members/search",
-      "domain": "banking.example.com",
+      "domain": "localhost:5000",
       "page_name": "member_search",
       "description": "Reviewed member search page",
       "allowed_actions": ["navigate", "type", "click", "read", "wait", "checkpoint"],
       "allowed_elements": [
         {
           "element_id": "search_input",
-          "locator": {"strategy": "id", "value": "member_search_input"},
+          "locator": {"strategy": "id", "value": "member_id_search"},
           "action": "type",
           "description": "Member search field",
           "safe_to_type": true
@@ -20,12 +20,6 @@
           "action": "click",
           "description": "Submit member search",
           "safe_to_click": true
-        },
-        {
-          "element_id": "balance_display",
-          "locator": {"strategy": "id", "value": "savings_balance_display"},
-          "action": "read",
-          "description": "Savings balance display"
         }
       ]
     }

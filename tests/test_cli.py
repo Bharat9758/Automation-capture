@@ -33,6 +33,7 @@ def settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, objec
         "selenium_timeout_ms": 1000, "allowlist_path": str(tmp_path / "allowlist.json"),
         "redaction_level": "STRICT", "evidence_capture_level": "ERRORS",
         "log_level": "INFO", "max_replay_steps": 100, "replay_timeout_seconds": 300,
+        "locator_timeout_seconds": 7,
         "artifact_directory": str(tmp_path / "artifacts"), "target_app_port": 5000,
         "target_app_host": "127.0.0.1", "flask_secret_key": "x" * 40,
         "target_app_config_path": None,
@@ -159,6 +160,7 @@ def test_replay_passes_options_and_redacts_output(settings: dict[str, object],
     assert engine.call_args.args[2] == {"member_id": "12345"}
     assert engine.call_args.kwargs["evidence_capture_level"] == "ESCALATIONS_ONLY"
     assert engine.call_args.kwargs["timeout_seconds"] == 300
+    assert engine.call_args.kwargs["max_wait_ms"] == 7000
     assert json.loads(output.read_text(encoding="utf-8"))["status"] == "success"
     browser.quit.assert_called_once()
 

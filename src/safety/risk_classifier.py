@@ -350,11 +350,17 @@ def classify_action_risk(step: ActionStep, artifact: AutomationArtifact, step_nu
         score += 1
         evidence.append("multiple risky actions in sequence")
     level = RiskLevel(min(score, RiskLevel.CRITICAL))
+    configured_approval = os.environ.get("RISK_APPROVAL_REQUIRED", "CRITICAL").upper()
+    try:
+        approval_floor = RiskLevel[configured_approval]
+    except KeyError as exc:
+        raise ValueError("RISK_APPROVAL_REQUIRED must be SAFE, CAUTION, RISKY, or CRITICAL") from exc
     escalation = level == RiskLevel.CRITICAL or (level >= RiskLevel.RISKY and step.action in _WRITE_ACTIONS
-                                               and (irreversible or bool(failure_points) or risky_sequence))
+                                               and (irreversible or bool(failure_points) or risky_sequence)) or level >= approval_floor
     assessment = ActionRiskAssessment(risk_level=level, reasoning="; ".join(evidence) or "Routine action",
-                                      evidence=evidence, recommended_action=get_recommended_action(level),
-                                      requires_approval=level == RiskLevel.CRITICAL or escalation,
+                                      evidence=evidence, recommended_action="Human approval required before execution"
+                                      if escalation else get_recommended_action(level),
+                                      requires_approval=escalation,
                                       escalation_threshold=escalation)
     LOGGER.info("action_risk_assessed", extra={"event": "action_risk_assessed", "step": step_number,
                                               "risk_level": level.name.lower(), "factor_count": len(evidence),

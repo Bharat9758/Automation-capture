@@ -1,5 +1,99 @@
 # AutomationCapture
 
+AutomationCapture records Claude-guided browser workflows and replays saved
+artifacts with Selenium, reviewed allowlists, checkpoints, and human escalation.
+
+## Quick start
+
+1. Clone and install with Python 3.11 or newer:
+
+   ```bash
+   git clone https://github.com/Bharat9758/Automation-capture.git
+   cd Automation-capture
+   python -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   pip install -e .
+   ```
+
+2. Copy and review the configuration:
+
+   ```bash
+   cp .env.example .env
+   cp config/allowlist.example.json config/allowlist.json
+   cp config/target_app.allowlist.example.json config/target_app.allowlist.json
+   ```
+
+   Generate `FLASK_SECRET_KEY` with
+   `python -c "import secrets; print(secrets.token_hex(32))"` and add it to
+   `.env`. For the local demo, set
+   `ALLOWLIST_PATH=config/target_app.allowlist.json`; the generic example
+   only permits member search. The demo rules include `localhost:5000` and
+   `127.0.0.1:5000`. Review the rules for another target application.
+   Set `ANTHROPIC_API_KEY` before discovery.
+
+3. Run tests and the local demo:
+
+   ```bash
+   pytest tests/ -q
+   automation-capture test-app
+   ```
+
+   In another terminal, with the same environment active:
+
+   ```bash
+   automation-capture discovery --url http://localhost:5000 --goal "Log in as a demo member and view member 12345 savings balance" --output artifacts/member.json
+   automation-capture validate artifacts/member.json
+   automation-capture inspect artifacts/member.json
+   automation-capture replay --artifact artifacts/member.json --params member_id=12345
+   automation-capture export artifacts/member.json --format markdown
+   automation-capture --help
+   automation-capture discovery --help
+   ```
+
+   Discovery needs a working Claude API key and Chrome or Firefox WebDriver.
+   Inspect the saved artifact to see which input parameters it declares.
+
+## Configuration
+
+The `.env.example` template lists supported settings and defaults. Copy it
+to `.env`; the CLI reads that file from the current working directory.
+Use `--config path/to/file.env` to select another file. Exported environment
+variables take precedence. Git ignores `.env` and tracks `.env.example`.
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `ANTHROPIC_API_KEY` | unset | Claude credential for discovery; obtain it from [Anthropic Console](https://console.anthropic.com/). |
+| `BROWSER_DRIVER` | `chrome` | `chrome` or `firefox`; requires a browser and Selenium driver. |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`. |
+| `REDACTION_LEVEL` | `STRICT` | `BASIC`, `STRICT`, `PARANOID`, or `NONE` in development only. |
+| `EVIDENCE_CAPTURE_LEVEL` | `ERRORS` | `ALL`, `ERRORS`, or `ESCALATIONS_ONLY`. |
+| `TARGET_APP_PORT` | `5000` | Local Flask port; update the demo allowlist if changed. |
+| `FLASK_SECRET_KEY` | unset | Random secret required for `test-app`. |
+| `MAX_REPLAY_STEPS` | `100` | Maximum artifact steps accepted by the CLI. |
+| `REPLAY_TIMEOUT_SECONDS` | `300` | Overall CLI replay deadline in seconds. |
+| `ALLOWLIST_PATH` | `config/allowlist.json` | Reviewed JSON allowlist required for replay. |
+| `LOCATOR_TIMEOUT_SECONDS` | `10` | CLI locator and checkpoint wait in seconds. |
+| `STUCK_STATE_THRESHOLD` | `3` | Repeated states before escalation; legacy `STUCK_REPEAT_THRESHOLD` takes precedence if set. |
+| `RISK_APPROVAL_REQUIRED` | `CRITICAL` | Minimum approval level: `SAFE`, `CAUTION`, `RISKY`, or `CRITICAL`. Existing irreversible-action checks remain. |
+| `ENVIRONMENT` | `development` | Deployment label: `development`, `staging`, or `production`. It does not enable an allowlist bypass. |
+
+Other browser, recording, audit, retention, and risk policy settings are
+documented in `.env.example`. The separate `ALLOWLIST_MODE=production`
+controls whether local testing bypass tokens can be used.
+
+### Troubleshooting
+
+- Missing Claude key: set `ANTHROPIC_API_KEY` before discovery.
+- Missing Flask key: generate a unique `FLASK_SECRET_KEY` and restart the app.
+- Missing allowlist: copy a reviewed JSON example and set `ALLOWLIST_PATH`.
+  The demo needs the full `target_app.allowlist.json`.
+- Navigation denied: match `ALLOWED_DOMAINS`, allowlist `domain`, and the
+  full `url_pattern`. A changed demo port requires updated reviewed rules.
+- Browser startup fails: install the selected browser and Selenium driver.
+- Tests cannot import packages: activate the environment and install the
+  pinned requirements.
+
 ## Metadata redaction (Phase 16)
 
 `REDACTION_LEVEL=STRICT` is the default. `BASIC` masks obvious financial and identity fields; `STRICT` also masks names, member IDs, and pattern matches; `PARANOID` retains identifiers, timestamps, states, and metrics while masking other metadata. `NONE` is accepted only when `ALLOWLIST_MODE=development`. Optional `REDACTION_FIELDS` and `REDACTION_PATTERNS` are JSON lists. Malformed policies stop replay before browser actions.
@@ -10,7 +104,7 @@ Field and regex masking cannot reliably identify every person or arbitrary ID in
 
 ## Action risk classification (Phase 15)
 
-`src.safety.risk_classifier.classify_action_risk` assigns safe, caution, risky, or critical risk to each recorded replay step. Scores accumulate from action type, reviewed locator and reasoning keywords, prior failures and recovery, and sequence position. It does not inspect typed parameter values. The `RISK_*` settings in `config.example.env` configure keyword weights and sequence thresholds; malformed policy configuration stops replay. Every assessment is attached to `ReplayResult` and persisted in session metadata with a per-step risk level.
+`src.safety.risk_classifier.classify_action_risk` assigns safe, caution, risky, or critical risk to each recorded replay step. Scores accumulate from action type, reviewed locator and reasoning keywords, prior failures and recovery, and sequence position. It does not inspect typed parameter values. The `RISK_*` settings in `.env.example` configure keyword weights and sequence thresholds; malformed policy configuration stops replay. Every assessment is attached to `ReplayResult` and persisted in session metadata with a per-step risk level.
 
 Replay checks the allowlist first. Caution actions log and continue; risky actions warn, and elevated risky cases pause for review. Critical actions pause before execution. A human operator can take control of the original session and call `SessionManager.approve_risk_action(session, RiskApproval(...))` while controlling it, followed by `approve_resume(session, resume_step=<paused step>)` and `give_control_to_automation(session)`. The resumed replay verifies that this explicit approval belongs to the paused step and persists it before executing the step. An operator can instead complete the step manually and approve resuming at the next step. A general resume signal without a step approval cannot execute a critical action. The allowlist still denies forbidden actions even when a risk approval exists.
 
@@ -30,7 +124,7 @@ Use Python 3.11 or newer:
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp config.example.env .env
+cp .env.example .env
 pytest -q
 ```
 
@@ -108,7 +202,7 @@ URL expectations use substring matching by default, with exact and regex choices
 
 `src.escalation.stuck_detector` fingerprints URL, title, visible text, and visible control count to detect repeated page states. Replay checks an upcoming click for risky words (such as `transfer` or `delete`) and multiple visible target matches before clicking. Three unchanged observations after meaningful actions also pause replay. Call `replay_artifact(..., request_human_help=True)` to pause before navigation.
 
-A pause returns `ReplayResult(status="escalated", success=False, stuck_state=..., escalation_request=...)` with the reason, one-based pending step, recommendation, and browser snapshot. Hard failures keep `status="hard_failure"` and carry an escalation request when evidence can be captured and saved. Business outcomes keep their own status. The signature truncation, repeat threshold, history length, risky keywords, and number of visible elements in evidence are configured with `STUCK_*` variables in `config.example.env`. Evidence contains full DOM and screenshots and may contain sensitive data.
+A pause returns `ReplayResult(status="escalated", success=False, stuck_state=..., escalation_request=...)` with the reason, one-based pending step, recommendation, and browser snapshot. Hard failures keep `status="hard_failure"` and carry an escalation request when evidence can be captured and saved. Business outcomes keep their own status. The signature truncation, repeat threshold, history length, risky keywords, and number of visible elements in evidence are configured with `STUCK_*` variables in `.env.example`. Evidence contains full DOM and screenshots and may contain sensitive data.
 
 ## Escalation requests
 
@@ -197,7 +291,7 @@ show where evidence was saved and which optional signals were unavailable.
 Install the package in an environment containing Python 3.11 or newer with
 `pip install -e .`. This installs the `automation-capture` command; use
 `python -m src.cli` from the repository root for the same interface. Configure
-`.env` from `config.example.env`; `--config path/to/file.env` selects a
+`.env` from `.env.example`; `--config path/to/file.env` selects a
 different dotenv file. Explicit environment variables take precedence. The
 CLI supports `--verbose`, `--quiet`, and `--log-file private.jsonl` both
 before and after a command.

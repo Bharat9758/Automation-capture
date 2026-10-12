@@ -96,6 +96,17 @@ def test_repeat_threshold_and_bounded_tracker(state: dict[str, object], monkeypa
     assert [item["step_number"] for item in steps] == [2, 3, 4]
 
 
+def test_new_stuck_threshold_setting(state: dict[str, object], monkeypatch: pytest.MonkeyPatch) -> None:
+    """The public threshold setting controls repeated-state detection."""
+    monkeypatch.delenv("STUCK_REPEAT_THRESHOLD", raising=False)
+    monkeypatch.setenv("STUCK_STATE_THRESHOLD", "2")
+    tracker = StateTracker()
+    tracker.add_state(state, 1)
+    assert not tracker.is_looping()
+    tracker.add_state(state, 2)
+    assert tracker.is_looping()
+
+
 def test_risk_and_context(sample_artifact: AutomationArtifact) -> None:
     """Only potentially irreversible clicks require approval."""
     assert is_risky_action(sample_artifact.steps[1], sample_artifact)

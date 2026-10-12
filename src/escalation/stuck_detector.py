@@ -36,7 +36,10 @@ def _positive_setting(name: str, default: int) -> int:
         ValueError: If the setting is not a positive integer.
     """
     try:
-        value = int(os.environ.get(name, str(default)))
+        raw = os.environ.get(name)
+        if name == "STUCK_REPEAT_THRESHOLD" and raw is None:
+            raw = os.environ.get("STUCK_STATE_THRESHOLD")
+        value = int(raw if raw is not None else str(default))
         if value > 0:
             return value
     except ValueError:

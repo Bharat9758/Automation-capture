@@ -146,3 +146,7 @@ def test_development_bypass_never_works_in_production(rules: Path, monkeypatch: 
                       value=None, reasoning="Delete account", expected_outcome="Done")
     with pytest.raises(AllowlistViolation):
         enforce_allowlist(driver, step, Mock(), load_allowlist(str(rules)))
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("ALLOWLIST_MODE", "development")
+    with pytest.raises(AllowlistViolation):
+        enforce_allowlist(driver, step, Mock(), load_allowlist(str(rules)))

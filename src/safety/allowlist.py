@@ -393,7 +393,8 @@ def enforce_allowlist(driver: WebDriver, step: ActionStep, artifact: AutomationA
                                                   "step": step.step_number, "reason": reason})
         raise AllowlistViolation(reason, element_id, step.action, url)
 
-    if (os.environ.get("ALLOWLIST_MODE") == "development" and os.environ.get("ALLOWLIST_BYPASS_TOKEN")
+    if (os.environ.get("ENVIRONMENT", "development") == "development"
+            and os.environ.get("ALLOWLIST_MODE") == "development" and os.environ.get("ALLOWLIST_BYPASS_TOKEN")
             and os.environ.get("ALLOWLIST_BYPASS_PRESENTED_TOKEN") == os.environ.get("ALLOWLIST_BYPASS_TOKEN")):
         LOGGER.warning("allowlist_dev_bypass", extra={"event": "allowlist_dev_bypass", "step": step.step_number})
         return True, None
