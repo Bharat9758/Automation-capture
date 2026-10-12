@@ -1,35 +1,77 @@
-# AutomationCapture Project Report
+# AutomationCapture: Design and Delivery Report
 
-Phase 16 adds configurable metadata redaction at basic, strict, and paranoid levels. It applies field and pattern masks to action audits, escalation metadata, session persistence, reports, and JSON logs. Raw screenshots and DOM remain unchanged for private human handoff and are stored separately with owner-only file permissions. Saved output values are masked while in-memory replay outputs remain available to callers. `NONE` is restricted to development mode; strict redaction is the default.
+This report describes the implementation through Phases 27–28. It distinguishes the tested local prototype from deployment work still required for a live banking environment. The full test suite measured **300 passing tests and 86% overall statement coverage** in Phases 22–26; see [tests/COVERAGE.md](tests/COVERAGE.md) for component results and gaps.
 
-Phase 15 scores each recorded action using configurable keyword weights, failure and recovery history, and sequence context. It records the risk grade in the replay result and session audit. Caution continues with a structured event, risky actions warn, and critical or elevated risky actions pause before execution. Step-bound human approvals are recorded in the existing handoff and session files before replay proceeds in the original browser. Allowlist denial remains a hard barrier regardless of approval.
+## 1. Architecture
 
-Phase 14 adds a reviewed, fail-closed JSON page and element allowlist to replay. It checks destinations before navigation and checks interaction, recovery, checkpoint, and output targets before use. Forbidden action keywords stop replay; actions requiring confirmation pause for the existing human handoff. The example rules need review and customization before use with another application.
+AutomationCapture has four cooperating subsystems:
 
-## 1. Summary
+| Subsystem | Modules | Responsibility |
+| --- | --- | --- |
+| Discovery | `src/agent/`, `src/artifact/recorder.py` | Observe the page, ask Claude for the next action, use Selenium to act, and record a successful trace. |
+| Replay | `src/replay/`, `src/artifact/serializer.py` | Load and validate an artifact, substitute inputs, execute saved steps without Claude, verify a checkpoint, and extract outputs. |
+| Escalation | `src/escalation/` | Detect a blocked or risky state, persist a request, transfer control of the live driver, and track the session lifecycle. |
+| Safety and audit | `src/safety/`, `src/logging/` | Check destinations and elements, grade action risk, redact persisted metadata, and collect JSON events and browser evidence. |
 
-Phases 1 through 13 establish the project structure, a bounded Claude-guided discovery loop, an artifact schema, recording, JSON persistence, locator resolution, deterministic replay, classified outcomes, checkpoint verification, stuck state detection, persisted escalation requests, same-browser human handoff, and lifecycle tracking.
+Discovery and replay communicate through a versioned artifact. This boundary makes a recorded automation inspectable and reusable with new inputs. The local Flask target app is a separate test fixture; configuration and CLI modules provide the user-facing entry point.
 
-## 2. Scope
+A legitimate negative result, such as “member not found,” is a **business outcome**, not a broken automation. The replay result separates `success`, `business_outcome`, `recoverable_error`, `hard_failure`, and `escalated` statuses as applicable. The operator handoff retains the same live Selenium driver and browser session, avoiding a new login. Logs and session metadata are redacted, while raw browser evidence is stored separately with restricted local permissions.
 
-The agent observes one Selenium browser session and executes five action types on configured domains. The recorder converts successful traces to artifacts describing replay steps, inputs, outputs, and checkpoints. Artifacts can be saved to and loaded from disk. The replay engine executes those artifacts in Selenium with ordered locator fallbacks, runtime error classification, and a checkpoint gate before output extraction. Stuck states create persisted escalation requests and paused handoff sessions on the existing WebDriver; lifecycle records retain timing and state across a human resume.
+## 2. Artifact Schema
 
-## 3. Architecture
+`AutomationArtifact` is a Pydantic dataclass with a unique ID, semantic version, timezone-aware timestamps, creator and discovery-run metadata, target URL, named inputs, declared outputs, ordered steps, a final success checkpoint, known-error rules, and optional human-intervention history. Its nested `Locator` accepts CSS, XPath, ID, text, or ARIA label plus ordered fallback locators and robustness notes. `ActionStep` records the action, optional locator and value, expected outcome, timeout, and reasoning.
 
-`Observer` collects browser signals; `llm_agent` sends the screenshot and state to Claude; `Actor` validates locators and domains before executing actions. The recorder maps completed traces into Pydantic dataclasses. The serializer validates JSON Schema and cross-field rules, then writes comment-prefixed JSON files atomically. `LocatorResolver` finds candidates by CSS, XPath, ID, direct text, or aria-label. `replay_artifact` validates parameters, navigates allowed domains, executes actions, calls `CheckpointVerifier`, then extracts typed outputs. `error_handler` evaluates explicit known-error conditions and runs allowlisted repairs. `stuck_detector` tracks page signatures; `escalation_request` saves JSON requests; `human_handoff` manages live-driver control; `session_manager` tracks and persists the complete run. Module loggers write JSON events.
+Recording replaces successful typed literals with named placeholders such as `{member_id}`; callers provide input values at replay time. Output fields identify the element and type to extract. Known-error detections can identify a valid business result, a recoverable condition, or a hard failure. Recorder inference is a starting point: reviewers must check step intent, selectors, error rules, and checkpoint strength before production reuse.
 
-## 4. Implementation
+`to_json()` emits plain JSON; `save_artifact_to_file()` writes an atomic file with three `#` metadata header lines before the JSON body. The provided `load_artifact_from_file()` handles those headers, validates nested schema data, and checks the stored version. A generic JSON parser must use `to_json()` output, not the complete header-prefixed file. The CLI validator also requires absolute HTTP(S) values for navigation steps.
 
-The loop enforces step and elapsed-time limits, detects three consecutive unchanged observations, validates model JSON, and returns action records without typed values. The recorder replaces typed literals with parameter placeholders, infers fields from successful reads, notes failed attempts, and adds locator robustness notes. The serializer provides plain JSON conversion and file round trips with field-specific errors. The resolver tries nested fallback locators in order, waits for visibility, and retries stale references. Replay runs saved actions without model calls, retries safe recoverable conditions a bounded number of times, and reports legitimate business outcomes. The verifier checks visible or existing elements, text, URL, and element count, then captures structured evidence on failure. Risky or ambiguous clicks and repeated unchanged page states pause replay. Phase 11 adds UUID-identified escalation requests. Phase 12 records explicit control transfers and audited human actions. Phase 13 tracks step success and timing, state transitions, escalation recovery, terminal outcomes, and retention of local audits.
+## 3. Determinism & Error Handling
 
-## 5. Configuration
+Replay reads only the artifact and runtime inputs; it does not call Claude. It validates required inputs and URL policy, navigates, substitutes placeholders in a copy of the steps, resolves locators, executes actions, and waits for applicable outcomes. A resolver tries the primary locator and its ordered fallbacks, waits for visibility, and refreshes stale references. CSS, XPath, ID, text, and ARIA-label strategies are supported. A stable plan yields the same **intended actions** for the same artifact and inputs; external page or data changes can yield different observed outcomes.
 
-Copy `config.example.env` to `.env`. Choose an active `LLM_MODEL`, provide an API key to the discovery caller, and set `ALLOWED_DOMAINS` for discovery and replay navigation. Recorder settings control the input scan limit, step timeout, initial version, and creator label. Replay accepts a per-call maximum wait in milliseconds. `ERROR_DETECTION_TIMEOUT_SECONDS` bounds known-error element lookups; `REPLAY_MAX_RECOVERY_RETRIES` bounds retry attempts. Checkpoint settings control polling, text case handling, URL match mode, and evidence snippet length. `STUCK_*` settings control fingerprint truncation, repetition threshold, history limits, risky action keywords, and visible-control capture. `ESCALATION_DIRECTORY`, `HANDOFF_DIRECTORY`, and `SESSION_DIRECTORY` set local evidence folders; `SESSION_RETENTION_DAYS` sets the default retention age. The Anthropic SDK was upgraded from the Phase 1 pin because that old release has no Messages API.
+The error handler evaluates reviewed `known_errors` detections before applying exception-based classifications. Matched business outcomes return a valid negative result without extracting outputs or creating an unnecessary handoff. Recoverable conditions can execute an allowlisted repair and retry within `REPLAY_MAX_RECOVERY_RETRIES`. Clicks are not automatically retried without an explicit recovery path because their effect may already have occurred. Hard failures retain the failed step and available screenshot, DOM, URL, and title.
 
-## 6. Verification
+The final `CheckpointVerifier` gates output extraction. It supports visible or existing elements, text, URL expectations, and element counts with bounded waits. **A failed checkpoint produces no extracted outputs.** Descriptive `expected_outcome` strings alone do not prove a business goal; use explicit condition directives and a specific final checkpoint. Discovery completion is Claude's assessment of its observation, so the artifact and replay checkpoint need independent review.
 
-Run `pytest -q`. Agent tests cover observation, domain restrictions, XPath escaping, typed-value omission, completion, dead-end, and step limits. Schema tests cover round trips and invalid fields. Recorder tests cover inference and integration. Serializer tests cover JSON and file round trips, metadata headers, invalid JSON, missing nested fields, and failed writes. Locator tests cover all strategies, fallbacks, visibility waits, stale recovery, and failure reports. Replay and error-handler tests cover validation, substitution, actions, output conversion, navigation restrictions, business outcomes, and bounded recovery. Checkpoint tests cover all five conditions, URL modes, text case handling, timeouts, failure evidence, and output gating. Stuck, escalation, handoff, and lifecycle tests cover detection, private persistence, control transitions, operator actions, same-browser replay resume, state transitions, metrics, and retention. No live Claude request or real browser integration is exercised yet.
+## 4. Heterogeneity & Multi-Tenant
 
-## 7. Risks and Next Steps
+Target-specific behavior lives in artifacts and reviewed JSON allowlists rather than in a bank-specific replay branch. Each allowlist names exact domains, paths, elements, locator fallbacks, and allowed actions. Environment variables configure browser choice, allowed domains, risk thresholds, redaction, logging, timeouts, and evidence paths. The same event and evidence formats apply to the local test app and to another approved browser application.
 
-Claude's discovery completion claim is not independently verified. A recorded URL or visible element checkpoint can still be weaker than the intended business goal; explicit known-error rules can prevent false success when their conditions match. Discovery's basic `attempt_*` entries cannot classify outcomes until detection rules are authored. Descriptive step outcomes do not assert page state; use condition directives for intermediate assertions. Checkpoint evidence, nested session escalations, and outputs can contain personal data even after input metadata redaction. Evidence storage requires appropriate access controls beyond local private file permissions. Risk keywords can miss irreversible actions with unfamiliar wording; review artifact policy before production use. A click without an explicit recovery action is never retried automatically. Disk serialization does not provide a shared artifact index or global ID uniqueness. The metadata header means saved files require the provided loader rather than an ordinary JSON parser. Text locator case matching covers ASCII letters. The mock operator acts only on explicitly supplied actions; persisted metadata cannot restore a lost browser process. Remote viewing, operator authentication, and real browser integration remain future work.
+Sessions use UUIDs and per-session evidence directories; reports can be retrieved by session ID. This is **organization and trace separation**, not a multi-tenant security boundary. The current process has no tenant identity, role-based access control, per-tenant key management, isolated workers, or remotely shared session store. A deployment serving independent tenants must add those controls, validate paths and ownership, define retention policies, and protect raw evidence separately.
+
+The included example allowlist covers the local app's primary selectors. Discovery may add an equivalent fallback such as a CSS ID lookup, but replay checks **every fallback** against the reviewed allowlist too. New applications and recorded artifacts therefore require policy review before use.
+
+## 5. Escalation & Handoff
+
+The stuck detector hashes URL, title, visible text, and control count, using a configurable repetition threshold (default three). It also considers hard failure, ambiguity, risky upcoming actions, and an explicit request for help. On a pause, replay persists an escalation request with its reason, pending step, recommendation, recent actions, screenshot, DOM, URL, and redacted input metadata. A session-scoped evidence collector stores available signals and a manifest.
+
+`SessionManager` in `human_handoff.py` transfers control from automation to a human and back on the **same live WebDriver**. Operator actions are timestamped. A human must explicitly approve the pending step or confirm that the step was completed manually before automation resumes at the chosen next step; a critical risk approval is bound to that step. Resumed replay verifies the artifact, browser, session, and approval before continuing, then checks the final success condition.
+
+`SessionLifecycleManager` in `session_manager.py` records creation, running, pause, human control, resume, completion, failure, and abandonment, along with step timings and escalations. JSON snapshots preserve an audit trail but cannot recreate a closed browser. The bundled `MockOperatorInterface` executes only prepared actions; it does not offer co-browsing, authenticate an operator, or automatically grant approval. The CLI closes its WebDriver after discovery or replay, so a live pause/resume integration must use the Python API in a persistent process.
+
+## 6. Safety
+
+The three layers have different jobs:
+
+| Layer | Enforcement | Result |
+| --- | --- | --- |
+| Reviewed allowlist | Exact domain/path checks, permitted page actions and elements, forbidden keywords, and approval rules before navigation or interaction. | Deny an unapproved operation before the browser acts. |
+| Action risk | Cumulative scoring from action type, locator and reasoning, failures, recovery, and sequence; SAFE, CAUTION, RISKY, CRITICAL. | Log or warn; pause elevated actions for explicit human approval. |
+| Data redaction | Configured field and pattern masks on process logs, structured audit events, session records, and exported summaries. | Limit sensitive values in shareable metadata. |
+
+An approval does not override a forbidden or unknown element. `ALLOWED_DOMAINS` also limits navigation independently of the replay allowlist. Development bypass tokens require explicit development mode; production mode ignores them. `REDACTION_LEVEL=STRICT` is the default, while `NONE` is limited by environment validation.
+
+Raw screenshots and DOM snapshots remain unredacted so a human can diagnose the actual page. They can contain personal and financial information. Local evidence writes use owner-only permissions where supported and evidence paths are ignored by Git, but deployments still need access controls, encryption and retention suited to their data. Keyword-based risk and masking cannot detect every unfamiliar irreversible action or every identifier in free prose; policy review remains necessary.
+
+## 7. Cuts & Future Work
+
+| Current boundary | Reason for the cut | Next step |
+| --- | --- | --- |
+| Mock operator rather than remote co-browsing | Core same-session control and approvals can be tested without building streaming UI. | Authenticated operator console with controlled session sharing and action audit. |
+| JSON files and in-memory demo data rather than a database | Local tests need no external service. | Transactional storage, artifact registry, retention, and access rules for multiple deployments. |
+| Optional driver-provided HAR, no built-in proxy or video | Screenshots, DOM, console logs, timings, and error context cover the current debugging path. | Introduce a reviewed network capture/proxy and optional video if required. |
+| Single-process live handoff | A saved session ID cannot reconnect to a closed WebDriver. | Session broker or remote driver with authentication and explicit reconnection semantics. |
+| Mocked browser and Claude in automated integration tests | CI remains repeatable and self-contained. | Run an opt-in real-browser test against the local Flask app and a separate, controlled Claude smoke test. |
+| Incomplete per-module coverage targets | Current measured coverage is 86% overall; replay engine is 83%, safety package 87%. | Add targeted tests for remaining recovery, policy, and filesystem exception branches. |
+
+Work was prioritized around the discovery-to-artifact-to-replay contract, checkpoint-gated extraction, legitimate business outcomes, allowlist and approval enforcement, session continuity, audit evidence, and a self-contained test application. Phases 29–31 remain future delivery work; this report does not label them completed.

@@ -1,7 +1,22 @@
 # AutomationCapture
 
-AutomationCapture records Claude-guided browser workflows and replays saved
-artifacts with Selenium, reviewed allowlists, checkpoints, and human escalation.
+Computer-use automation recording and replay for browser-based legacy
+applications, including banking workflows. Claude observes a page during
+discovery and records a reusable artifact; Selenium replays it without an LLM.
+Reviewed allowlists, risk assessment, checkpoints, human handoff, and evidence
+support controlled execution.
+
+## Key features
+
+| Capability | What it does |
+| --- | --- |
+| LLM discovery | Observes screenshots and page state, chooses actions, and records reusable steps with input placeholders. |
+| Deterministic replay | Executes a saved artifact without a model call, using ordered locator fallbacks. |
+| Human escalation | Packages stuck or risky states and pauses the original WebDriver for an explicit decision. |
+| Safety | Checks destinations and elements against an allowlist, grades action risk, and redacts persisted metadata. |
+| Audit and evidence | Stores structured JSON events, timings, screenshots, DOM snapshots, and escalation context by session. |
+| Local test app | Exercises login, member search, balances, invalid input, delays, and flaky responses in Flask. |
+| CLI | Discovers, replays, validates, inspects, lists, and exports artifacts. |
 
 ## Quick start
 
@@ -12,8 +27,7 @@ artifacts with Selenium, reviewed allowlists, checkpoints, and human escalation.
    cd Automation-capture
    python -m venv .venv
    source .venv/bin/activate
-   pip install -r requirements.txt
-   pip install -e .
+   python -m pip install -e '.[test]'
    ```
 
 2. Copy and review the configuration:
@@ -42,17 +56,76 @@ artifacts with Selenium, reviewed allowlists, checkpoints, and human escalation.
    In another terminal, with the same environment active:
 
    ```bash
-   automation-capture discovery --url http://localhost:5000 --goal "Log in as a demo member and view member 12345 savings balance" --output artifacts/member.json
+   automation-capture discovery --url http://127.0.0.1:5000/ --goal "Log in using the local demo credentials, find member 12345, and read the savings balance" --output artifacts/member.json
    automation-capture validate artifacts/member.json
    automation-capture inspect artifacts/member.json
-   automation-capture replay --artifact artifacts/member.json --params member_id=12345
+   # Review all recorded locators, including fallbacks, against the allowlist.
+   # Supply every input declared by the inspected artifact:
+   automation-capture replay --artifact artifacts/member.json --params username_input=member password_input=password member_id_search=12345 --output result.json
    automation-capture export artifacts/member.json --format markdown
    automation-capture --help
    automation-capture discovery --help
    ```
 
    Discovery needs a working Claude API key and Chrome or Firefox WebDriver.
-   Inspect the saved artifact to see which input parameters it declares.
+   The public demo credentials are in `config/target_app.example.json`; give
+   Claude the demo login details it needs. The replay parameter names above
+   are illustrative and depend on the artifact's recorded steps. The example
+   allowlist lists primary IDs, while recording can add equivalent CSS ID
+   fallbacks. Review and approve those fallbacks before replay. Use these
+   credential values for the local demo only; real credentials should not
+   appear in command-line arguments.
+
+## Architecture
+
+```mermaid
+flowchart TB
+  A["Claude discovery: observe, decide, act"] --> B["Versioned artifact"]
+  B --> C["Validate inputs and reviewed policy"]
+  C --> D["Deterministic Selenium replay"]
+  D --> E{"Outcome and checkpoint"}
+  E -->|"verified"| F["Extract outputs and audit"]
+  E -->|"business result"| G["Return valid negative outcome"]
+  E -->|"failure or risk"| H["Classify, recover, or pause for human"]
+  H -->|"approved live handoff"| D
+```
+
+The artifact is the contract between discovery and replay. Replay makes no
+model calls and extracts outputs only after final checkpoint verification.
+Browser page changes can change the observed business outcome despite a
+deterministic action plan. The audit follows success, business outcomes,
+failures, and escalations through the same session lifecycle.
+
+## Safety and escalation at a glance
+
+1. **Allowlist:** Reviewed domains, URLs, elements, locator fallbacks, and
+   actions are required before execution. Unapproved targets fail closed.
+2. **Risk:** Steps are graded SAFE, CAUTION, RISKY, or CRITICAL. Caution is
+   logged; risky actions can pause under policy; critical actions require
+   explicit step-bound human approval. Approval cannot bypass the allowlist.
+3. **Redaction:** Logs and persisted metadata mask sensitive fields. Raw
+   screenshots and DOM remain private evidence and require restricted access.
+
+Repeated unchanged states, ambiguous targets, hard failures, explicit help
+requests, and elevated risk can create an escalation with the pending step,
+reason, screenshot, DOM, and recent actions. The included operator interface
+is a local mock. A live handoff needs an integrator to keep the original
+WebDriver open; the CLI closes its driver after a run.
+
+## Project structure
+
+| Path | Responsibility |
+| --- | --- |
+| `src/agent/` | Claude observation and browser action loop |
+| `src/artifact/` | Pydantic schema, recorder, and JSON persistence |
+| `src/replay/` | Locators, actions, error classification, checkpoints |
+| `src/escalation/` | Stuck detection, requests, handoff, lifecycle |
+| `src/safety/` | Allowlist, risk assessment, metadata redaction |
+| `src/logging/` | Structured events and session evidence |
+| `src/target_app/` | Local Flask app and demo fixture |
+| `src/config.py`, `src/cli.py`, `src/main.py` | Settings, commands, entry point |
+| `config/` | Example allowlists and local app fixture |
+| `tests/` | Unit/integration tests, [coverage report](tests/COVERAGE.md), [testing guide](tests/TEST_GUIDE.md) |
 
 ## Configuration
 
@@ -82,7 +155,7 @@ Other browser, recording, audit, retention, and risk policy settings are
 documented in `.env.example`. The separate `ALLOWLIST_MODE=production`
 controls whether local testing bypass tokens can be used.
 
-### Troubleshooting
+### Configuration troubleshooting
 
 - Missing Claude key: set `ANTHROPIC_API_KEY` before discovery.
 - Missing Flask key: generate a unique `FLASK_SECRET_KEY` and restart the app.
@@ -94,7 +167,7 @@ controls whether local testing bypass tokens can be used.
 - Tests cannot import packages: activate the environment and install the
   pinned requirements.
 
-## Metadata redaction (Phase 16)
+## Metadata redaction
 
 `REDACTION_LEVEL=STRICT` is the default. `BASIC` masks obvious financial and identity fields; `STRICT` also masks names, member IDs, and pattern matches; `PARANOID` retains identifiers, timestamps, states, and metrics while masking other metadata. `NONE` is accepted only when `ALLOWLIST_MODE=development`. Optional `REDACTION_FIELDS` and `REDACTION_PATTERNS` are JSON lists. Malformed policies stop replay before browser actions.
 
@@ -102,31 +175,19 @@ Escalation requests and saved session reports use redacted metadata. Saved sessi
 
 Field and regex masking cannot reliably identify every person or arbitrary ID in free prose. Review metadata before external sharing. Saved session records contain only redacted placeholders for nested escalation screenshots and DOM; the original raw evidence is kept in restricted escalation files.
 
-## Action risk classification (Phase 15)
+## Action risk classification
 
 `src.safety.risk_classifier.classify_action_risk` assigns safe, caution, risky, or critical risk to each recorded replay step. Scores accumulate from action type, reviewed locator and reasoning keywords, prior failures and recovery, and sequence position. It does not inspect typed parameter values. The `RISK_*` settings in `.env.example` configure keyword weights and sequence thresholds; malformed policy configuration stops replay. Every assessment is attached to `ReplayResult` and persisted in session metadata with a per-step risk level.
 
 Replay checks the allowlist first. Caution actions log and continue; risky actions warn, and elevated risky cases pause for review. Critical actions pause before execution. A human operator can take control of the original session and call `SessionManager.approve_risk_action(session, RiskApproval(...))` while controlling it, followed by `approve_resume(session, resume_step=<paused step>)` and `give_control_to_automation(session)`. The resumed replay verifies that this explicit approval belongs to the paused step and persists it before executing the step. An operator can instead complete the step manually and approve resuming at the next step. A general resume signal without a step approval cannot execute a critical action. The allowlist still denies forbidden actions even when a risk approval exists.
 
-## Replay allowlist (Phase 14)
+## Replay allowlist
 
 Set `ALLOWLIST_PATH` to a reviewed JSON file for the target application. Copy `config/allowlist.example.json` and edit its exact domains, paths, allowed actions, and element locators. Replay refuses to start if the file is missing or invalid. Every initial or recorded navigation, element action, recovery action, output read, and checkpoint locator is checked. Unapproved redirects stop replay. `ALLOWED_DOMAINS` remains a separate navigation restriction. Exact paths start with `/`; use `regex:<expression>` for a full-path regular expression. Locator fallbacks must also be reviewed.
 
 Global forbidden keywords deny actions. Actions requiring confirmation pause for human review; an operator can perform the step in the existing session and explicitly resume at the next step. Keep `allow_new_urls` and `allow_unknown_elements` false. An optional local bypass requires `ALLOWLIST_MODE=development` and identical nonempty `ALLOWLIST_BYPASS_TOKEN` and `ALLOWLIST_BYPASS_PRESENTED_TOKEN`. Production mode ignores bypass tokens. The example covers only member search; add every target and destination path for other workflows.
 
-AutomationCapture discovers browser workflows with a Claude-guided Selenium agent and records reusable artifacts for later deterministic replay. Phases 2 through 13 add page observation, browser actions, a bounded discovery loop, a versioned artifact schema, recording, JSON file persistence, robust locator resolution, deterministic replay, runtime outcome classification, checkpoint verification, stuck state detection, escalation requests, a mock human handoff, and session lifecycle tracking. Phase 19 includes a local Flask fixture for browser testing.
-
-## Development setup
-
-Use Python 3.11 or newer:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-pytest -q
-```
+## Discovery API
 
 Set a real `ANTHROPIC_API_KEY` in `.env` before making live Claude requests. The calling program must create a Selenium WebDriver and pass its API key to `run_goal_driven_loop(..., api_key=...)`. `ALLOWED_DOMAINS` controls the exact hosts (and optional ports) the agent can visit; navigation is denied when this list is empty. `LLM_MODEL`, request timeout, token limit, observation limits, and action wait timeout are configurable in `.env`.
 
@@ -242,7 +303,7 @@ On resume, pass the approved `handoff_session` to `replay_artifact`. It loads it
 
 `list_sessions()` lists saved audits newest first. `cleanup_old_sessions(directory, days=None)` removes only **terminal** lifecycle JSON files older than the configured `SESSION_RETENTION_DAYS` (default 30). It leaves paused/running records, handoff files, and escalation evidence intact. Use `get_session_summary`, `get_full_session_report`, and `calculate_session_metrics` for reports without duplicating screenshots.
 
-## Phase 17 audit events
+## Audit events
 
 Replay writes a redacted, session-scoped JSON event array to
 `LOG_DIRECTORY/<lifecycle-session-id>.json` (default `evidence/logs`). Events
@@ -253,7 +314,7 @@ the configured `REDACTION_LEVEL`, and screenshots and DOM snapshots stay in
 the separate private evidence path. `STRUCTURED_LOG_LEVEL` controls console
 output while preserving the complete event array.
 
-## Local Flask test app (Phase 19)
+## Local Flask test app
 
 Set `FLASK_SECRET_KEY` in `.env` to a unique value of at least 32 characters;
 generate one with `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
@@ -272,7 +333,7 @@ The fixture is verified with `pytest tests/test_local_app.py` using Flask's
 test client. `TARGET_APP_HOST` and `TARGET_APP_PORT` configure the local bind;
 host choices are limited to loopback addresses.
 
-## Phase 18 evidence capture
+## Evidence capture
 
 Replay saves private browser evidence under `EVIDENCE_DIRECTORY/<session-id>`
 (default `evidence/capture`). Step timings are recorded in `metrics/`; a passed
@@ -286,7 +347,7 @@ contain unredacted page content and are written with owner-only permissions on
 POSIX. `ReplayResult.evidence_manifest_path` and `evidence_capture_errors`
 show where evidence was saved and which optional signals were unavailable.
 
-## Command-line interface (Phase 20)
+## CLI commands
 
 Install the package in an environment containing Python 3.11 or newer with
 `pip install -e .`. This installs the `automation-capture` command; use
@@ -348,3 +409,34 @@ the [testing guide](tests/TEST_GUIDE.md) for fixtures, mock boundaries, and
 instructions for adding workflow tests. The suite uses mocked Selenium and
 Claude boundaries plus Flask's in-process client; it does not exercise a live
 browser or Anthropic account.
+
+## Example workflow
+
+1. Start `automation-capture test-app` with a private Flask key and the reviewed
+   demo allowlist. Use the demo-only credentials in the fixture.
+2. Run `discovery --url ... --goal ... --output artifacts/member.json` with a
+   valid Claude key and a goal that includes enough context to log in.
+3. Run `validate` and `inspect`. Review all saved actions and fallbacks against
+   the allowlist; add approved fallbacks to that policy before replay.
+4. Run `replay --artifact artifacts/member.json --params KEY=VALUE ... --output
+   result.json` with all declared inputs. The CLI opens a fresh browser.
+5. Open `result.json` for the redacted status and outputs; keep raw screenshot
+   and DOM evidence private. For a live handoff, use the Python API and retain
+   the original WebDriver.
+
+## Contributing
+
+Add a focused test for each new action, failure mode, or policy rule. Use the
+isolated browser doubles and Flask test client described in
+[TEST_GUIDE.md](tests/TEST_GUIDE.md). Review app-specific URLs, actions, and
+locators in an allowlist; keep input values parameterized in artifacts. Run
+`pytest tests/ -q` before proposing changes.
+
+## Project stats and limits
+
+At the Phases 27–28 documentation pass: **300 passing tests, 86% overall
+statement coverage, 26 Python source files, 24 test modules, and seven Flask
+HTML templates**. Phases 29–31 remain planned. The local demo needs no
+external database. A remote co-browsing UI, tenant authorization, live browser
+validation, and a built-in network proxy are outside this implementation.
+See [REPORT.md](REPORT.md) for the design decisions and future work.
